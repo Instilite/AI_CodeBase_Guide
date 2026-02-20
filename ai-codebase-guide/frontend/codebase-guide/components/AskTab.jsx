@@ -12,52 +12,18 @@ const QUICK_QUESTIONS = [
   'How is authentication handled?',
 ]
 
-const ANALYSIS_CARDS = [
-  {
-    title: 'Purpose',
-    body: 'FastAPI is a modern, high-performance web framework for building APIs with Python, based on standard Python type hints. It is designed for speed, ease of use, and automatic OpenAPI documentation generation.',
-    evidence: ['E1', 'E3'],
-  },
-  {
-    title: 'Entry Points',
-    body: (
-      <>
-        The main application entry point is <code style={{ color: 'var(--accent2)' }}>fastapi/applications.py</code>{' '}
-        which defines the FastAPI class. Users instantiate this class and register routes via decorators such as{' '}
-        <code style={{ color: 'var(--accent2)' }}>@app.get()</code> and{' '}
-        <code style={{ color: 'var(--accent2)' }}>@app.post()</code>.
-      </>
-    ),
-    evidence: ['E2', 'E5'],
-  },
-  {
-    title: 'Key Modules',
-    body: (
-      <>
-        Core routing is handled in <code style={{ color: 'var(--accent2)' }}>fastapi/routing.py</code>. Dependency
-        injection is managed through <code style={{ color: 'var(--accent2)' }}>fastapi/dependencies/utils.py</code>.
-        Request validation integrates with Pydantic via{' '}
-        <code style={{ color: 'var(--accent2)' }}>fastapi/_compat.py</code>.
-      </>
-    ),
-    evidence: ['E4', 'E6'],
-  },
-  {
-    title: 'Main Flow',
-    body: (
-      <>
-        Requests flow through Starlette's ASGI interface → FastAPI routing → dependency resolution → endpoint execution
-        → response serialization via <code style={{ color: 'var(--accent2)' }}>encoders.py</code> → JSON response
-        returned to client.
-      </>
-    ),
-    evidence: ['E1', 'E2', 'E4'],
-  },
-]
+function confidencePct(val) {
+  return Math.round(val * 100) / 100
+}
 
-export default function AskTab() {
-  const [activeQuestion, setActiveQuestion] = useState(QUICK_QUESTIONS[0])
-  const [inputValue, setInputValue] = useState(QUICK_QUESTIONS[0])
+export default function AskTab({ onEvidenceUpdate, onFilesUpdate }) {
+  const [activeQuestion, setActiveQuestion] = useState(null)
+  const [inputValue, setInputValue] = useState('')
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState(null)
+  const [claims, setClaims] = useState([])
+  const [confidence, setConfidence] = useState(null)
+  const [confidenceLabel, setConfidenceLabel] = useState(null)
   const textareaRef = useRef(null)
 
   const handleQuickSelect = (question) => {
@@ -68,9 +34,62 @@ export default function AskTab() {
 
   const handleInputChange = (e) => {
     setInputValue(e.target.value)
+    setActiveQuestion(null)
     e.target.style.height = 'auto'
     e.target.style.height = Math.min(e.target.scrollHeight, 120) + 'px'
   }
+
+  const handleAsk = async () => {
+    const question = inputValue.trim()
+    if (!question || loading) return
+
+    const sessionId = localStorage.getItem('uploadSessionId')
+    if (!sessionId) {
+      setError('Please upload a repo first using the Upload Repo button.')
+      return
+    }
+
+    setLoading(true)
+    setError(null)
+    setClaims([])
+    setConfidence(null)
+    setConfidenceLabel(null)
+    onEvidenceUpdate([])
+
+    try {
+      const response = await fetch('/api/ask', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question, sessionId }),
+      })
+
+      const data = await response.json()
+
+      if (!response.ok) {
+        throw new Error(data.error || 'Something went wrong')
+      }
+
+      setClaims(data.claims || [])
+      setConfidence(data.confidence)
+      setConfidenceLabel(data.confidenceLabel)
+      onEvidenceUpdate(data.evidence || [])
+      onFilesUpdate(data.totalFiles)
+
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleKeyDown = (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault()
+      handleAsk()
+    }
+  }
+
+  const hasResults = claims.length > 0
 
   return (
     <>
@@ -94,50 +113,144 @@ export default function AskTab() {
           className="search-input"
           value={inputValue}
           onChange={handleInputChange}
+          onKeyDown={handleKeyDown}
           rows={1}
-          placeholder="What does this project do?"
+          placeholder="Ask anything about your codebase..."
+          disabled={loading}
         />
-        <button className="ask-btn">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#0e0e12" strokeWidth="2.5">
-            <line x1="5" y1="12" x2="19" y2="12" />
-            <polyline points="12 5 19 12 12 19" />
-          </svg>
+        <button
+          className="ask-btn"
+          onClick={handleAsk}
+          disabled={loading || !inputValue.trim()}
+          style={{ opacity: loading || !inputValue.trim() ? 0.5 : 1 }}
+        >
+          {loading ? (
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#0e0e12" strokeWidth="2.5" style={{ animation: 'spin 1s linear infinite' }}>
+              <path d="M21 12a9 9 0 1 1-6.219-8.56" />
+            </svg>
+          ) : (
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#0e0e12" strokeWidth="2.5">
+              <line x1="5" y1="12" x2="19" y2="12" />
+              <polyline points="12 5 19 12 12 19" />
+            </svg>
+          )}
         </button>
       </div>
 
-      <div className="confidence-bar-wrap">
-        <span className="conf-label">Retrieval Confidence</span>
-        <div className="conf-track">
-          <div className="conf-fill" />
+      {/* Error state */}
+      {error && (
+        <div style={{
+          margin: '0 20px 16px',
+          padding: '12px 16px',
+          background: 'rgba(245,80,80,0.1)',
+          border: '1px solid rgba(245,80,80,0.3)',
+          borderRadius: '8px',
+          color: '#f55050',
+          fontSize: '12px',
+          lineHeight: 1.6,
+        }}>
+          {error}
         </div>
-        <span className="conf-val">0.61</span>
-        <span className="conf-tag">Medium</span>
-      </div>
+      )}
 
-      <div className="analysis-header">
-        <span className="analysis-title">Analysis</span>
-        <div className="analysis-right">
-          <div className="overview-tag">Overview</div>
-          <span className="claims-tag">4 claims</span>
-        </div>
-      </div>
-
-      <div className="cards-area">
-        {ANALYSIS_CARDS.map((card) => (
-          <div key={card.title} className="card">
-            <div className="card-header">
-              <span className="card-title">{card.title}</span>
-              <span className="project-map-tag">Project Map</span>
+      {/* Loading skeleton */}
+      {loading && (
+        <div style={{ padding: '0 20px 16px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '16px', color: 'var(--text-dim)', fontSize: '12px' }}>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" style={{ animation: 'spin 1s linear infinite', flexShrink: 0 }}>
+              <path d="M21 12a9 9 0 1 1-6.219-8.56" />
+            </svg>
+            Analyzing codebase with Claude...
+          </div>
+          {[1,2,3].map(i => (
+            <div key={i} style={{
+              background: 'var(--surface2)',
+              border: '1px solid var(--border)',
+              borderRadius: '8px',
+              padding: '16px',
+              marginBottom: '10px',
+            }}>
+              <div style={{ height: '12px', background: 'var(--border)', borderRadius: '4px', width: '40%', marginBottom: '10px', animation: 'pulse 1.5s ease-in-out infinite' }} />
+              <div style={{ height: '10px', background: 'var(--border)', borderRadius: '4px', width: '90%', marginBottom: '6px', animation: 'pulse 1.5s ease-in-out infinite' }} />
+              <div style={{ height: '10px', background: 'var(--border)', borderRadius: '4px', width: '75%', animation: 'pulse 1.5s ease-in-out infinite' }} />
             </div>
-            <div className="card-body">{card.body}</div>
-            <div className="evidence-tags">
-              {card.evidence.map((e) => (
-                <span key={e} className="ev-tag">{e}</span>
-              ))}
+          ))}
+        </div>
+      )}
+
+      {/* Results */}
+      {hasResults && !loading && (
+        <>
+          <div className="confidence-bar-wrap">
+            <span className="conf-label">Retrieval Confidence</span>
+            <div className="conf-track">
+              <div className="conf-fill" style={{ width: `${confidence * 100}%` }} />
+            </div>
+            <span className="conf-val">{confidencePct(confidence)}</span>
+            <span className="conf-tag">{confidenceLabel}</span>
+          </div>
+
+          <div className="analysis-header">
+            <span className="analysis-title">Analysis</span>
+            <div className="analysis-right">
+              <div className="overview-tag">Overview</div>
+              <span className="claims-tag">{claims.length} claims</span>
             </div>
           </div>
-        ))}
-      </div>
+
+          <div className="cards-area">
+            {claims.map((claim, i) => (
+              <div key={i} className="card">
+                <div className="card-header">
+                  <span className="card-title">{claim.title}</span>
+                  <span className="project-map-tag">Project Map</span>
+                </div>
+                <div className="card-body">{claim.body}</div>
+                {claim.relevantFiles && claim.relevantFiles.length > 0 && (
+                  <div className="evidence-tags">
+                    {claim.relevantFiles.map((f, j) => (
+                      <span key={j} className="ev-tag" style={{ fontSize: '10px', maxWidth: '160px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {f}
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+
+      {/* Empty state — no query yet */}
+      {!hasResults && !loading && !error && (
+        <div style={{
+          flex: 1,
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          justifyContent: 'center',
+          color: 'var(--text-dim)',
+          padding: '40px 20px',
+          textAlign: 'center',
+          gap: '10px',
+        }}>
+          <div style={{ fontSize: '32px', opacity: 0.3 }}>⌨</div>
+          <div style={{ fontSize: '12px', lineHeight: 1.6, maxWidth: '240px' }}>
+            Upload a repo then ask anything about it. Results will appear here.
+          </div>
+        </div>
+      )}
+
+      <style>{`
+        @keyframes spin {
+          from { transform: rotate(0deg); }
+          to { transform: rotate(360deg); }
+        }
+        @keyframes pulse {
+          0%, 100% { opacity: 0.4; }
+          50% { opacity: 0.8; }
+        }
+      `}</style>
     </>
   )
 }

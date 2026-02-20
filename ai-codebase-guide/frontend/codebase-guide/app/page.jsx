@@ -3,7 +3,6 @@
 import { useState } from 'react'
 import TopBar from '../components/TopBar'
 import LeftPanel from '../components/LeftPanel'
-import RightPanel from '../components/RightPanel'
 
 export default function Page() {
   const [theme, setTheme] = useState('dark')
@@ -17,7 +16,6 @@ export default function Page() {
       <TopBar theme={theme} toggleTheme={toggleTheme} />
       <div className="main-layout">
         <LeftPanel />
-        <RightPanel />
       </div>
     </div>
   )
