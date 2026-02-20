@@ -33,3 +33,5 @@ backend/chroma_db/*
 .idea/
 .vscode/
 
+uploaded_repos
+
