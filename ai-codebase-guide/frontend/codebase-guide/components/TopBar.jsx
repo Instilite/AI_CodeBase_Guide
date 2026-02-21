@@ -65,20 +65,8 @@ export default function TopBar({ theme, toggleTheme }) {
   return (
     <header className="topbar">
       <div className="logo-badge">CG</div>
-      <span className="topbar-title">Codebase Guide</span>
+      <span className="topbar-title" style={{ color: '#ffffff' }}>Codebase Guide</span>
       <div className="divider-v" />
-
-      <div className="repo-selector">
-        <div className="repo-dot" />
-        <span>fastapi / fastapi</span>
-        <span style={{ color: 'var(--text-dim)' }}>▾</span>
-      </div>
-
-      <div className="meta-pills">
-        <span className="meta-pill">1,247 chunks</span>
-        <span className="meta-pill">83 files</span>
-        <span className="meta-pill">text-embedding-3-small</span>
-      </div>
 
       <div className="topbar-actions">
         <button
@@ -108,8 +96,6 @@ export default function TopBar({ theme, toggleTheme }) {
           />
         </button>
 
-        <button className="btn-new">New Index</button>
-
         <button className="btn-theme" onClick={toggleTheme} title="Toggle light/dark mode">
           {theme === 'dark' ? '🌙' : '☀️'}
         </button>
@@ -124,3 +110,4 @@ export default function TopBar({ theme, toggleTheme }) {
     </header>
   )
 }
+
