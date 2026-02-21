@@ -79,7 +79,7 @@
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 10px 20px;
+  padding: 8px 20px;
   animation: gradientShift 6s ease infinite;
 
   background: linear-gradient(270deg, #1a1040, #2d1b69, #1a0e3d, #3d1f8a, #1a1040);
@@ -98,7 +98,7 @@
 
 
 .logo-badge {
-  width: 32px; height: 32px;
+  width: 42px; height: 42px;
   background: var(--accent);
   border-radius: 6px;
   box-shadow: 0 0 12px rgba(245, 166, 35, 0.7), 0 0 25px rgba(245, 166, 35, 0.3);
@@ -121,7 +121,7 @@
 
 .divider-v {
   width: 1px;
-  height: 20px;
+  height: 32px;
   background: var(--border);
 }
 
@@ -718,4 +718,8 @@
 .app[data-theme="light"] .topbar span,
 .app[data-theme="light"] .topbar button {
   color: #000000 !important;
+}
+
+.app[data-theme="light"] .topbar img {
+  mix-blend-mode: multiply;
 }

@@ -64,8 +64,8 @@ export default function TopBar({ theme, toggleTheme }) {
 
   return (
     <header className="topbar">
-      <div className="logo-badge">CG</div>
-      <span className="topbar-title" style={{ color: '#ffffff' }}>Codebase Guide</span>
+      <img src="/better logo 2 .png" alt="Logo" style={{ width: '90px', height: '60px', borderRadius: '8px' }} />
+      <span className="topbar-title" style={{ color: '#ffffff', fontSize: '18px', marginLeft: '-8px' }}>Codebase Guide</span>
       <div className="divider-v" />
 
       <div className="topbar-actions">
@@ -110,4 +110,5 @@ export default function TopBar({ theme, toggleTheme }) {
     </header>
   )
 }
+
 
