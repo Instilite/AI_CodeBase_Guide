@@ -58,10 +58,10 @@ export default function AskTab({ onEvidenceUpdate, onFilesUpdate }) {
 
     try {
       const response = await fetch('/api/ask', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question, sessionId }),
-      })
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question, sessionId }),
+    })
 
       const data = await response.json()
 
