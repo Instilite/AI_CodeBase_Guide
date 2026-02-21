@@ -28,10 +28,12 @@ export default function LeftPanel() {
           </div>
         </div>
 
-        {activeTab === 'ask' && (
-          <AskTab onEvidenceUpdate={setEvidence} onFilesUpdate={setTotalFiles} />
-        )}
-        {activeTab === 'impact' && <ImpactTab />}
+        <div style={{ display: activeTab === 'ask' ? 'flex' : 'none', flexDirection: 'column', flex: 1 }}>
+  <AskTab onEvidenceUpdate={setEvidence} onFilesUpdate={setTotalFiles} />
+</div>
+<div style={{ display: activeTab === 'impact' ? 'block' : 'none' }}>
+  <ImpactTab />
+</div>
       </div>
 
       <RightPanel evidence={evidence} totalFiles={totalFiles} />
