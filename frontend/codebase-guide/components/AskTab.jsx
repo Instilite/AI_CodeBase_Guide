@@ -195,16 +195,7 @@ export default function AskTab({
             </div>
           )}
 
-          {confidence !== null && (
-            <div className="confidence-bar-wrap">
-              <span className="conf-label">Retrieval Confidence</span>
-              <div className="conf-track">
-                <div className="conf-fill" style={{ width: `${safeConfidence * 100}%` }} />
-              </div>
-              <span className="conf-val">{safeConfidence.toFixed(2)}</span>
-              <span className="conf-tag">{formatConfidenceLabel(response?.confidence_label)}</span>
-            </div>
-          )}
+
 
           <div className="analysis-header">
             <span className="analysis-title">Analysis</span>

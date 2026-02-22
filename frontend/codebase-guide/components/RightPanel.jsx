@@ -101,10 +101,6 @@ export default function RightPanel({ evidence = [], totalFiles, activeEvidenceId
                   <span className="ev-file">
                     {filePath}<span>{filename}</span>
                   </span>
-                  {chunk.start_line ? (
-                    <span className="ev-lines">L{chunk.start_line}–{chunk.end_line}</span>
-                  ) : null}
-                  <span className={`ev-pct ${simClass}`}>{simPct === null ? '—' : `${simPct}%`}</span>
                 </div>
                 <div className="ev-source">{chunk.source === 'grep' ? 'grep' : 'vector'}</div>
                 {chunk.text && (
