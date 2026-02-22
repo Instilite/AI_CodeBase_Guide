@@ -1,0 +1,1387 @@
+AI CODEBASE GUIDE
+FINAL CANONICAL BACKEND CONSTITUTION
+Single Authoritative Implementation Contract  ·  Supersedes All Prior Documents
+AUTHORITY: This Constitution merges and supersedes four source documents:
+  1. AI Codebase Guide — Final Master Execution Plan Rev 2
+  2. Combined Backend Master Plan v2 (Patched)
+  3. API Contracts & Schemas Final
+  4. Failure Scenarios + Mitigations Spec
+Where source documents conflict, the stricter rule prevails. All conflicts are explicitly resolved herein.
+No new behavior, no new endpoints, no new error codes, no new infrastructure.
+Every enforcement constraint from every source document is preserved in full.
+
+SECTION 1 — System Architecture & Execution Flow
+
+1.1 Project Identity
+The AI Codebase Guide is a two-tab web application that performs retrieval-augmented code analysis. It is not a chatbot. It is not a GPT wrapper. Every answer surfaces the exact code chunks it used, every citation is clickable, and every impact score is computed mechanically from grep results — not inferred by a model.
+
+1.2 Locked Stack
+Component
+Locked Decision
+Runtime
+FastAPI + Uvicorn (Python 3.11+)
+Vector DB
+ChromaDB PersistentClient(path="./chroma_db")  —  local only, persists across restarts
+Chroma distance
+hnsw:space=cosine  REQUIRED on every get_or_create_collection() call. Pre-condition for sim=1-d.
+Embeddings
+text-embedding-3-small (OpenAI). No substitutes. Batch size: 64 chunks per request.
+LLM
+gpt-4o-mini with response_format=JSON (strict JSON output)
+Prohibited
+No reranking. No extra providers. No AST parsing. No additional external services.
+
+1.3 Backend Module Map
+Module
+Responsibility
+main.py
+FastAPI app, all route definitions, background task wiring, startup lifecycle
+ingest.py
+ZIP extraction, file filtering, size enforcement, zip-slip protection
+chunker.py
+Universal line-based chunking with overlap
+embedder.py
+OpenAI embedding calls with retry logic
+store.py
+ChromaDB read/write operations, collection management
+retriever.py
+Vector search, mode detection, diversity cap, confidence score computation
+grep.py
+Word-boundary regex search, definition detection, context-window extraction
+llm.py
+LLM call, JSON schema enforcement, Fallback A try/catch
+main.py (startup)
+Job file cleanup (mtime > 86400s), demo repo seeding verification
+
+1.4 Filesystem Layout
+All paths are relative to the backend working directory.
+
+Path
+Purpose & Rules
+./repos/{repo_id}/
+Filtered source files used for grep, chunking, and embedding
+./repos/{repo_id}/.indexing
+Existence = indexing in progress. mtime > 1800s = stale (orphaned). Must be deleted on any indexing failure.
+./repos/{repo_id}/repo_meta.json
+SOLE EXISTENCE ORACLE. Presence = repo is ready and queryable. Absence = 404 for all repo-scoped operations.
+./chroma_db/
+Chroma PersistentClient data directory. Must survive server restart intact.
+./jobs/{job_id}.json
+Job status file. Persists across restarts. Deleted on startup if status=complete|failed and mtime > 86400s.
+./tmp/{job_id}/
+Temporary extraction directory. Removed after successful filtered-file move to ./repos/{repo_id}/.
+
+Conflict Resolution — Job persistence:
+Rev 2 stated 'jobs are in-memory'. Combined Backend Master Plan v2 and API Contracts supersede this with disk-persisted job files (./jobs/{job_id}.json) that survive restarts.
+The stricter rule (disk persistence) prevails. In-memory job store is NOT used.
+
+1.5 repo_meta.json Schema
+{ "repo_id": "demo_repo",
+  "name":    "demo_repo.zip",
+  "indexed_at": "2026-02-21T12:00:00Z",
+  "chunk_count": 1234 }
+
+1.6 jobs/{job_id}.json Schema
+{ "job_id":      "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+  "repo_id":     "demo_repo",
+  "status":      "indexing|complete|failed",
+  "chunk_count": 412,
+  "error":       null }
+
+1.7 Repo ID and Job ID Derivation
+repo_id:
+	•	base = Path(upload.filename).stem
+	•	sanitize: lowercase, replace spaces with _, keep [a-z0-9_-], trim to 48 chars
+	•	if collision: suffix _{sha1(filename+timestamp)[:8]}
+
+job_id:
+UUID4. Always unique. Stored immediately at ./jobs/{job_id}.json on creation.
+
+Chroma collection name:
+Always f"repo_{repo_id}". No exceptions. Seed script must use repo_demo_repo for demo_repo.
+
+1.8 Data Flow Summary
+Ingestion flow:
+	•	POST /upload → validate ZIP → create job file + .indexing marker → return 202 immediately
+	•	Background task: filter files → chunk (100 lines, 20-line overlap) → embed (batches of 64) → upsert Chroma
+	•	On success: remove .indexing, write repo_meta.json, set job=complete
+	•	On failure: remove .indexing, set job=failed with error message, do NOT write repo_meta.json
+
+Ask flow:
+	•	Guard: stale cleanup → 409 check → 404 check
+	•	Detect mode (keyword match) → retrieve (12 or 60 internal) → dedup → diversity cap → freeze list
+	•	Assign E1..Ek labels → build LLM prompt → call LLM → Fallback A → return AskResponse
+
+Impact flow:
+	•	Guard: stale cleanup → 409 check → 404 check
+	•	Word-boundary grep → definition detection → build grep chunks (clamped context)
+	•	Embed function_name → query Chroma top-6 → merge + dedup → freeze list
+	•	Assign E1..En labels → build LLM prompt → call LLM → Fallback A → return ImpactResponse
+
+SECTION 2 — Endpoint Contracts (All 7 Endpoints)
+
+2.1  GET /health
+Always returns 200. No guards. No repo checks. No indexing checks. Never returns 409. This endpoint cannot produce an error response.
+
+Request
+No body. No path parameters. No query parameters.
+
+Success Response — 200 OK
+class HealthResponse(BaseModel):
+    status: Literal["ok"]
+
+// Example:
+{ "status": "ok" }
+
+2.2  GET /repos
+Request
+No body. No path parameters. No query parameters.
+
+Guard Sequence — must execute in this exact order
+1. Run stale-marker cleanup: scan ./repos/*/.indexing. Delete any whose mtime > 1800s.
+2. Scan remaining ./repos/*/.indexing files. If any exist (non-stale): return 409.
+   Note: repo_id is null in the 409 body — /repos is a multi-repo gate.
+3. If no markers: scan ./repos/*/repo_meta.json and return list.
+
+Success Response — 200 OK
+class RepoListItem(BaseModel):
+    repo_id:     str   # sanitized identifier, e.g. 'demo_repo'
+    name:        str   # original zip filename, e.g. 'demo_repo.zip'
+    chunk_count: int   # total chunks in Chroma collection
+    indexed_at:  str   # ISO 8601 UTC, e.g. '2026-02-21T08:00:00Z'
+
+# Response body: JSON array of RepoListItem
+# Source of truth: ./repos/*/repo_meta.json
+
+// Example response:
+[
+  { "repo_id": "demo_repo", "name": "demo_repo.zip",
+    "chunk_count": 1234, "indexed_at": "2026-02-21T08:00:00Z" }
+]
+
+Error Responses
+HTTP
+error code
+Body
+409
+indexing_in_progress
+{ "error": "indexing_in_progress", "message": "Indexing in progress. Try again soon.", "repo_id": null, "details": null }
+500
+internal_error
+{ "error": "internal_error", "message": "..." }
+
+2.3  POST /upload
+Request — multipart/form-data
+# Field name: file
+# Content-Type: multipart/form-data
+async def upload(file: UploadFile = File(...)): ...
+
+ZIP Validation Sequence — must execute in this exact order
+1. Reject if content-length > 15,728,640 bytes (15 MB compressed) → 413 zip_too_large.
+2. Open ZIP. Sum ZipInfo.file_size across all entries. If sum > 209,715,200 bytes (200 MB) → 413 zip_too_large.
+3. Validate each entry: deny absolute paths, deny '..' segments, deny drive-letter prefixes.
+   If any entry resolves outside ./tmp/{job_id}/ → 422 zip_invalid (with offending_entry in details).
+4. Extract to ./tmp/{job_id}/. After extraction, recheck on-disk total <= 200 MB → 413 if exceeded.
+5. Filter files (see Section 4). Move filtered files to ./repos/{repo_id}/.
+Response returns immediately (202). All further work runs in background.
+
+Success Response — 202 Accepted
+class UploadResponse(BaseModel):
+    job_id:  str                  # UUID4
+    repo_id: str                  # sanitized, derived from filename
+    status:  Literal["indexing"]  # always 'indexing' at response time
+
+// Example:
+{ "job_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+  "repo_id": "my_repo",
+  "status": "indexing" }
+
+Error Responses
+HTTP
+error code
+Body
+413
+zip_too_large
+{ "error": "zip_too_large", "message": "Compressed upload size exceeds the 15 MB limit.", "details": { "limit_bytes": 15728640, "received_bytes": <n> } }
+413
+zip_too_large
+{ "error": "zip_too_large", "message": "Uncompressed content size exceeds the 200 MB limit.", "details": { "limit_bytes": 209715200, "declared_bytes": <n> } }
+422
+zip_invalid
+{ "error": "zip_invalid", "message": "Uploaded file is not a valid ZIP archive.", "details": null }
+422
+zip_invalid
+{ "error": "zip_invalid", "message": "Zip-slip path traversal detected. Upload rejected.", "details": { "offending_entry": "<name>" } }
+422
+validation_error
+{ "error": "validation_error", "message": "No file provided.", "details": {...} }
+500
+internal_error
+{ "error": "internal_error", "message": "..." }
+
+2.4  GET /status/{job_id}
+Always works. Never returns 409. Not blocked by indexing state under any condition.
+
+Request
+# Path parameter: job_id: str  (UUID4)
+// Example: GET /status/f47ac10b-58cc-4372-a567-0e02b2c3d479
+
+Success Response — 200 OK
+class JobStatusResponse(BaseModel):
+    job_id:      str
+    repo_id:     str
+    status:      Literal["indexing", "complete", "failed"]
+    chunk_count: int    # progress during indexing; final count on complete
+    error:       str | None  # null unless status=='failed'
+
+// Example — indexing:
+{ "job_id": "f47ac10b...", "repo_id": "my_repo",
+  "status": "indexing", "chunk_count": 412, "error": null }
+
+// Example — complete:
+{ "job_id": "f47ac10b...", "repo_id": "my_repo",
+  "status": "complete", "chunk_count": 1847, "error": null }
+
+// Example — failed:
+{ "job_id": "f47ac10b...", "repo_id": "my_repo",
+  "status": "failed", "chunk_count": 128,
+  "error": "Embedding API error: RateLimitError" }
+
+Error Responses
+HTTP
+error code
+Body
+404
+job_not_found
+{ "error": "job_not_found", "message": "No job found with the given ID.", "repo_id": null, "details": null }
+500
+internal_error
+{ "error": "internal_error", "message": "..." }
+
+2.5  POST /ask
+Request Schema
+class AskRequest(BaseModel):
+    repo_id:  str
+    question: str
+    mode:     str = "auto"  # Accepted but NEVER READ. Always auto-detected.
+
+// Example:
+{ "repo_id": "demo_repo", "question": "How does authentication work?", "mode": "auto" }
+
+Guard Sequence — must execute in this exact order
+1. Stale-marker cleanup: if ./repos/{repo_id}/.indexing exists and mtime > 1800s → delete it.
+2. 409 check: if ./repos/{repo_id}/.indexing still exists → return 409.
+3. 404 check: if ./repos/{repo_id}/repo_meta.json absent → return 404.
+4. Proceed with retrieval pipeline.
+
+Success Response — 200 OK
+class Claim(BaseModel):
+    claim:    str
+    evidence: List[str]  # subset of ['E1'..'Ek'] from the frozen chunk list
+
+class AskResponse(BaseModel):
+    repo_id:           str
+    retrieval_mode:    Literal["standard", "overview"]
+    confidence_score:  float    # round(mean(1-d for each chunk), 2). Range [0.0, 1.0].
+    confidence_label:  Literal["High", "Medium", "Low"]
+    claims:            List[Claim]        # [] when llm_fallback_used == True
+    chunks:            List[EvidenceChunk]
+    llm_fallback_used: bool
+
+// Example (standard mode):
+{
+  "repo_id": "demo_repo", "retrieval_mode": "standard",
+  "confidence_score": 0.61, "confidence_label": "High",
+  "claims": [{ "claim": "JWT tokens are verified in the auth middleware.",
+                "evidence": ["E1", "E3"] }],
+  "chunks": [
+    { "evidence_id": "E1", "file_path": "src/auth/middleware.py",
+      "start_line": 42, "end_line": 85,
+      "text": "def verify_jwt(token): ...",
+      "similarity": 0.7812, "source": "vector" }
+  ],
+  "llm_fallback_used": false
+}
+
+Error Responses
+HTTP
+error code
+Body
+409
+indexing_in_progress
+{ "error": "indexing_in_progress", "repo_id": "<id>", "message": "Repo is still indexing. Try again soon.", "details": null }
+404
+repo_not_found
+{ "error": "repo_not_found", "repo_id": "<id>", "message": "Repository not found.", "details": null }
+422
+validation_error
+{ "error": "validation_error", "message": "...", "details": {...} }
+500
+internal_error
+{ "error": "internal_error", "message": "..." }
+
+2.6  POST /impact
+Request Schema
+class ImpactRequest(BaseModel):
+    repo_id:       str
+    function_name: str  # raw identifier, e.g. 'verify_credentials'
+
+// Example:
+{ "repo_id": "demo_repo", "function_name": "verify_credentials" }
+
+Guard Sequence — identical to /ask, must execute in this exact order
+1. Stale-marker cleanup: if ./repos/{repo_id}/.indexing exists and mtime > 1800s → delete it.
+2. 409 check: if ./repos/{repo_id}/.indexing still exists → return 409.
+3. 404 check: if ./repos/{repo_id}/repo_meta.json absent → return 404.
+4. Proceed with grep + vector pipeline.
+
+Success Response — 200 OK
+class ImpactResponse(BaseModel):
+    repo_id:           str
+    function_name:     str
+    risk_level:        Literal["Low", "Medium", "High"]  # MECHANICAL ONLY
+    file_count:        int          # len(files_referencing); excludes definition file
+    files_referencing: List[str]    # relative paths; excludes definition file
+    what_it_does:      str          # LLM summary; '' when llm_fallback_used==True
+    message:           str | None   # non-null ONLY when grep finds zero files
+    chunks:            List[EvidenceChunk]  # grep chunks first, then vector
+    llm_fallback_used: bool
+
+// Example (grep found matches):
+{
+  "repo_id": "demo_repo", "function_name": "verify_credentials",
+  "risk_level": "Medium", "file_count": 2,
+  "files_referencing": ["src/auth/routes.py", "tests/test_auth.py"],
+  "what_it_does": "Validates username/password against the user store...",
+  "message": null,
+  "chunks": [
+    { "evidence_id": "E1", "file_path": "src/auth/routes.py",
+      "start_line": 18, "end_line": 38,
+      "text": "result = verify_credentials(user, pw) ...",
+      "similarity": null, "source": "grep" },
+    { "evidence_id": "E2", "file_path": "src/auth/middleware.py",
+      "start_line": 5, "end_line": 47,
+      "text": "def verify_credentials(username, password): ...",
+      "similarity": 0.7341, "source": "vector" }
+  ],
+  "llm_fallback_used": false
+}
+
+// Example (grep found nothing):
+{
+  "repo_id": "demo_repo", "function_name": "parse_token",
+  "risk_level": "Low", "file_count": 0, "files_referencing": [],
+  "what_it_does": "Decodes and validates a JWT string...",
+  "message": "No exact word-boundary grep matches found. Showing semantic evidence only.",
+  "chunks": [ /* vector-only */ ], "llm_fallback_used": false
+}
+
+Error Responses
+HTTP
+error code
+Body
+409
+indexing_in_progress
+{ "error": "indexing_in_progress", "repo_id": "<id>", "message": "Repo is still indexing. Try again soon.", "details": null }
+404
+repo_not_found
+{ "error": "repo_not_found", "repo_id": "<id>", "message": "Repository not found.", "details": null }
+422
+validation_error
+{ "error": "validation_error", "message": "...", "details": {...} }
+500
+internal_error
+{ "error": "internal_error", "message": "..." }
+
+2.7  DELETE /repos/{repo_id}
+No 409 guard on DELETE. Deletion proceeds even if indexing is in progress. If .indexing file exists: delete it as part of the directory removal.
+
+Request
+# Path parameter: repo_id: str
+// Example: DELETE /repos/demo_repo
+
+Deletion Scope — all three steps are mandatory
+	•	Delete directory tree: ./repos/{repo_id}/  (including .indexing if present)
+	•	Delete Chroma collection: repo_{repo_id}  (silently skip if collection does not exist)
+	•	Delete job files: any ./jobs/{job_id}.json where repo_id matches  (best-effort)
+
+Success Response — 200 OK
+class DeleteResponse(BaseModel):
+    deleted:  bool   # always True on success
+    repo_id:  str
+
+// Example:
+{ "deleted": true, "repo_id": "demo_repo" }
+
+Error Responses
+HTTP
+error code
+Body
+404
+repo_not_found
+{ "error": "repo_not_found", "repo_id": "<id>", "message": "Repository not found.", "details": null }
+500
+internal_error
+{ "error": "internal_error", "message": "..." }
+
+SECTION 3 — Guard Order & State Transitions
+
+3.1 Universal Guard Protocol
+Every guarded endpoint must execute the following steps in this exact order. Violation of this order is a defect.
+
+Step
+Action
+0 — Stale cleanup
+For each relevant .indexing file (repo-specific for /ask and /impact; all repos for /repos): if mtime > 1800 seconds ago, delete the file immediately. This step runs unconditionally before any 409 check.
+1 — 409 check
+After cleanup, check whether the (now-current) .indexing file exists. For /ask and /impact: check ./repos/{repo_id}/.indexing. For /repos: check any ./repos/*/.indexing. If present: return 409.
+2 — 404 check
+/ask and /impact only: check ./repos/{repo_id}/repo_meta.json. If absent: return 404. /repos: not applicable (returns list of all repos with repo_meta.json). DELETE /repos/{repo_id}: check repo_meta.json; 404 if absent.
+3 — Proceed
+All guards passed. Execute the endpoint's primary logic.
+
+3.2 Endpoints Exempt from Guards
+Endpoint
+Exemption
+GET /health
+Fully exempt. No guards. No 409. No 404. Always returns 200.
+GET /status/{job_id}
+Fully exempt from indexing guard. Never returns 409. Returns 404 only if job file is absent.
+DELETE /repos/{repo_id}
+Exempt from 409 guard. No stale cleanup required. 404 check on repo_meta.json still applies.
+
+3.3 Indexing State Machine
+State
+Conditions
+Next States
+not_indexed
+./repos/{repo_id}/ absent OR repo_meta.json absent
+→ indexing (via POST /upload)
+indexing
+./repos/{repo_id}/.indexing exists AND mtime <= 1800s
+→ complete (on success) | → failed (on error) | → stale (on server crash)
+stale
+./repos/{repo_id}/.indexing exists AND mtime > 1800s
+→ not_indexed (stale cleanup removes marker; no repo_meta.json → 404)
+complete
+repo_meta.json exists AND no .indexing file
+→ not_indexed (via DELETE) | → indexing (via new POST /upload for same repo_id)
+failed
+job file status='failed', .indexing absent, repo_meta.json absent
+→ not_indexed (operator runs DELETE to clean partial data) | → indexing (via new upload)
+
+State transition enforcement:
+complete → indexing (re-upload): must DELETE /repos/{repo_id} first. New upload creates new job_id.
+stale state self-heals: first guarded request that runs stale cleanup removes the marker. No explicit recovery endpoint needed.
+failed state is terminal: operator must call DELETE /repos/{repo_id} before re-uploading. Partial Chroma data and partial ./repos/{repo_id}/ directory remain but are inaccessible (no repo_meta.json).
+
+SECTION 4 — Upload & Indexing Lifecycle
+
+4.1 ZIP Validation (Synchronous — before any background work)
+Check
+Threshold
+Error
+Compressed size
+content-length > 15,728,640 bytes (15 MB)
+413 zip_too_large — reject immediately, no disk writes
+Uncompressed size (declared)
+sum(ZipInfo.file_size) > 209,715,200 bytes (200 MB)
+413 zip_too_large — checked before any extraction
+ZIP validity
+zipfile.BadZipFile raised on open
+422 zip_invalid — file is not a valid ZIP
+Path traversal (per entry)
+absolute path, '..' segment, or resolves outside ./tmp/{job_id}/
+422 zip_invalid — includes offending_entry in details; abort extraction; remove tmp dir
+On-disk size (post-extraction)
+actual on-disk bytes > 200 MB
+413 zip_too_large — remove ./tmp/{job_id}/, do not proceed to move
+
+4.2 File Filtering Rules
+Keep extensions:
+.py  .js  .ts  .tsx  .jsx  .css  .html  .md  .go  .java  .rb  .rs  .cpp  .c  .h
+
+Skip directories anywhere in path:
+.git  node_modules  dist  build  __pycache__  .venv  venv
+
+Skip binaries:
+If first 8 KB of file content contains a NUL byte (0x00): skip the file.
+
+4.3 Chunking
+	•	Split each filtered file into chunks of 100 lines with 20-line overlap.
+	•	Chunk metadata fields: repo_id, file_path (relative to repo root, no leading slash), start_line (0-indexed), end_line (0-indexed, inclusive), chunk_index (0..n-1), sha1(chunk_text)[:8].
+	•	Chunk ID: f"{file_path}:{chunk_index}:{sha1[:8]}"
+
+4.4 Background Job Lifecycle — State Transitions
+Event
+Required Actions (all mandatory)
+Job start
+(1) Create ./repos/{repo_id}/.indexing  (2) Write ./jobs/{job_id}.json with status=indexing, chunk_count=0
+Progress
+Periodically update ./jobs/{job_id}.json with current chunk_count
+Success
+(1) Remove ./repos/{repo_id}/.indexing  (2) Write ./repos/{repo_id}/repo_meta.json with final chunk_count and indexed_at (ISO 8601 UTC)  (3) Update ./jobs/{job_id}.json status=complete
+Failure (any cause)
+(1) Remove ./repos/{repo_id}/.indexing — MANDATORY, even if other steps fail  (2) Update ./jobs/{job_id}.json status=failed, error=<exception_class: message>  (3) Do NOT write repo_meta.json  (4) Partial ./repos/{repo_id}/ and Chroma data remain, inaccessible
+
+The .indexing marker MUST be removed in the failure path. Failure to remove it causes permanent 409 blocking that can only be resolved by the 30-minute stale-marker timeout. This is treated as a defect.
+
+4.5 App Startup Procedures
+	•	Startup job cleanup: scan ./jobs/. Delete any job file where status is 'complete' or 'failed' AND file mtime > 86400 seconds (24 hours).
+	•	Demo repo seeding: connect ChromaDB PersistentClient. Call get_collection('repo_demo_repo'). If collection exists and count > 0: skip. If absent or empty: run full ingestion pipeline on demo repo directory. After indexing, assert get_collection('repo_demo_repo').count() > 0.
+	•	Do NOT reindex the demo repo if the collection already exists and has items.
+
+4.6 Demo Repo Pass Condition
+	•	./repos/demo_repo/ exists on disk.
+	•	Chroma collection repo_demo_repo exists and is queryable.
+	•	POST /ask { "repo_id": "demo_repo", "question": "..." } returns non-empty chunks without triggering any reindex.
+
+SECTION 5 — Vector Store & Embedding Rules
+
+5.1 Chroma Collection Creation — Mandatory Configuration
+# This exact call is required for every collection. No exceptions.
+collection = client.get_or_create_collection(
+    name=f"repo_{repo_id}",
+    metadata={"hnsw:space": "cosine"}   # REQUIRED: enables sim = 1-d formula
+)
+
+# Naming rule: always f"repo_{repo_id}"
+# Demo repo: collection = repo_demo_repo (repo_id = demo_repo)
+
+hnsw:space=cosine is not optional. Without it, ChromaDB defaults to L2 distance. L2 distances are unbounded and can exceed 2.0. The formula sim = 1 - d produces negative values with L2, breaking confidence computation. This is a hard correctness requirement.
+Conflict resolution: API Contracts and Combined Backend Master Plan v2 both specify cosine. Rev 2 did not specify distance function. The stricter (explicit) specification prevails.
+
+5.2 Chroma Upsert Contract
+collection.upsert(
+    ids        = [f"{file_path}:{chunk_index}:{sha1[:8]}"],
+    documents  = [chunk_text],
+    metadatas  = [{ "repo_id": repo_id,
+                    "file_path": file_path,
+                    "start_line": start_line,
+                    "end_line": end_line,
+                    "chunk_index": chunk_index }],
+    embeddings = [embedding_vector]
+)
+
+5.3 Retrieval Parameters by Mode
+Parameter
+Standard Mode
+Overview Mode
+Internal Chroma n_results
+12
+60
+Target returned chunks
+8
+20
+Dedup rule
+(file_path, start_line) — first occurrence kept
+(file_path, start_line) — first occurrence kept
+Diversity cap (primary)
+max 4 chunks per file
+max 2 chunks per file (HARD CAP — never exceeded)
+Diversity relaxation
+Relax to 5/file, then no cap, to fill 8
+None — hard cap is absolute
+Minimum returned
+1 (never pad with duplicates)
+1 (never pad with duplicates)
+Max returned
+8
+20
+
+5.4 Confidence Computation — Mechanical, Always
+Formula (applies identically to standard and overview mode):
+1. For each selected chunk i: sim_i = 1 - chroma_cosine_distance_i
+   This is valid ONLY when hnsw:space=cosine is set. Result is in [0.0, 1.0].
+2. confidence_score = round(mean([sim_1, sim_2, ... sim_k]), 2)
+3. confidence_label thresholds:
+   >= 0.55  →  High
+   >= 0.35  →  Medium
+   <  0.35  →  Low  [frontend MUST display warning banner]
+Confidence is computed from the SELECTED chunk list only. LLM never reports or influences confidence.
+
+SECTION 6 — LLM Layer & Fallback A Enforcement
+
+6.1 Overview Detection (SA-1 fix) — POST /ask only
+Detection method: case-insensitive substring match on stripped question string.
+No model call. No extra latency. No separate classification step.
+Canonical keyword list (any single match triggers overview mode):
+  overview  |  summarize  |  summary  |  explain the codebase  |  what does this repo
+  high level  |  high-level  |  architecture  |  walkthrough  |  overall structure
+is_overview_query(question: str) -> bool
+
+6.2 Evidence Labeling — Mandatory Ordering
+CRITICAL: Violation of this ordering produces evidence ID mismatch and breaks all citations.
+Step 1: Finalize the chunk list. Apply: dedup by (file_path, start_line) → diversity cap → sort.
+Step 2: Assign E1..Ek labels. E1 = index 0. Ek = last index. Labels are assigned in this list order only.
+Step 3: Build the LLM prompt. Embed all labeled chunk texts into the system/user message.
+Step 4: Call the LLM. The LLM MUST receive all E-IDs and chunk texts in the prompt.
+The LLM call MUST occur AFTER labeling. No exceptions. No early LLM calls.
+This rule applies identically to /ask and /impact.
+
+6.3 LLM Prompt Hard Constraints (System Message)
+# These exact constraints must appear in the LLM system message:
+"Use only the provided evidence chunks."
+"Every claim must cite at least one evidence ID from E1..Ek."
+"Return valid JSON array only: [{\"claim\": \"...\", \"evidence\": [\"E1\", \"E3\"]}].
+ No other keys. No prose outside the JSON array."
+
+6.4 Fallback A — Complete Specification (CB-3 fix)
+try:
+    raw    = llm_response_text
+    parsed = json.loads(raw)
+    if not isinstance(parsed, list):
+        raise ValueError("LLM returned non-list JSON")
+    claims = parsed
+    llm_fallback_used = False
+except (json.JSONDecodeError, ValueError):
+    claims            = []
+    llm_fallback_used = True
+
+# Fallback A catches ALL of the following:
+# - Network failure / timeout before any response received
+# - Non-200 HTTP response from OpenAI API
+# - Truncated response (token limit hit mid-array) -> JSONDecodeError
+# - Valid JSON but not a list (e.g. {"answer": "..."}) -> ValueError
+# - Any other exception in the LLM call path
+
+# When Fallback A fires:
+# /ask:    claims=[], llm_fallback_used=True, chunks and confidence UNCHANGED
+# /impact: what_it_does='', llm_fallback_used=True, chunks and risk UNCHANGED
+
+# Fallback A ALWAYS returns HTTP 200. NEVER returns 500.
+# The raw malformed LLM text is NEVER propagated to the client.
+
+6.5 LLM Configuration
+Parameter
+Value
+Model
+gpt-4o-mini
+response_format
+JSON (strict JSON output mode)
+Max tokens
+1000 (sufficient for claims array)
+Temperature
+0 (deterministic output)
+Retry policy
+No automatic retry on failure — Fallback A activates immediately
+
+SECTION 7 — Impact Engine Rules
+
+7.1 Word-Boundary Grep
+import re
+pattern = re.compile(r"\b" + re.escape(function_name) + r"\b")
+
+# Scan ALL kept source files under ./repos/{repo_id}/
+# A file is in matching_files if pattern.search(file_content) is truthy
+# matching_files is a set of relative file paths
+
+7.2 Grep Context Window — Bounds-Clamped (MR-3 fix)
+# For each file in referencing_files, for first up to 2 grep matches:
+for match_line in first_two_match_lines(file):
+    start      = max(0, match_line - 10)       # ALWAYS clamp lower bound
+    end        = min(len(lines), match_line + 10)  # ALWAYS clamp upper bound
+    chunk_text = '\n'.join(lines[start:end])
+
+# Negative slice indices are impossible with this clamp.
+# Both bounds are mandatory. Neither may be omitted.
+
+7.3 Definition File Detection Algorithm (MR-4 fix)
+Heuristic patterns:
+Python: ^\s*def\s+{name}\s*\(   and   ^\s*class\s+{name}\s*[\(:]
+JS/TS:  ^\s*function\s+{name}\s*\(   and   ^\s*(export\s+)?(const|let|var)\s+{name}\s*=\s*(async\s*)?\(   and   ^\s*(export\s+default\s+)?class\s+{name}\b
+
+Selection algorithm (execute in this order):
+	•	Among files in matching_files, find those containing a definition-pattern match.
+	•	Filter out any file whose path contains 'test', 'mock', or 'stub' (case-insensitive substring match).
+	•	Among remaining candidates: for each file, find the earliest line where a definition pattern fires.
+	•	Pick the file with the smallest such line number. Tie-break: shortest file path string (lexicographic).
+	•	If no candidates remain after step 2 (all were test/mock/stub): re-run steps 3-4 WITHOUT the path filter.
+	•	If no definition pattern found in any file in matching_files: definition_file = null.
+
+Result:
+files_referencing = matching_files − {definition_file}    (set difference; definition_file may be null)
+file_count = len(files_referencing)
+definition_file is an internal implementation detail. It is NEVER exposed in any response body.
+
+7.4 Risk Level Computation — Mechanical Only
+file_count (len of files_referencing)
+risk_level
+0 or 1
+Low
+2 or 3
+Medium
+4 or more
+High
+
+Risk is derived solely from file_count of files_referencing. The LLM never sets, suggests, or influences risk_level. If the LLM output contains a risk_level field: discard it. The mechanically computed value is always used.
+
+7.5 Grep Finds Nothing — Zero-Match Response
+# When matching_files is empty:
+file_count        = 0
+files_referencing = []
+risk_level        = "Low"
+message           = "No exact word-boundary grep matches found. Showing semantic evidence only."
+
+# Vector retrieval still runs. what_it_does is still populated if LLM succeeds.
+# message is NON-NULL only in this case. Null in all other /impact responses.
+
+7.6 Evidence Merge and Labeling Order for /impact
+Step
+Action
+1
+Build grep evidence chunks for each referencing file (up to 2 context windows per file, bounds-clamped per 7.2). similarity = null for all grep chunks.
+2
+Embed function_name string using text-embedding-3-small.
+3
+Query Chroma for top 6 chunks. No diversity cap on /impact.
+4
+Merge grep chunks and vector chunks. Deduplicate by (file_path, start_line, end_line). Keep first occurrence.
+5
+Order: grep evidence first, then vector evidence.
+6 — FREEZE
+Freeze the final merged list. Assign E1..En labels in list order. This is the labeling step.
+7
+Build LLM prompt using the labeled list. LLM call occurs AFTER this step.
+
+similarity for vector chunks: round(1 - chroma_cosine_distance, 4). Range [0.0, 1.0].
+similarity for grep chunks: null. Never 0. Never omitted. This is mandatory.
+
+SECTION 8 — Error Model & Error Code Registry
+
+8.1 Universal Error Body — Every Endpoint, No Exceptions
+class ErrorResponse(BaseModel):
+    error:   str             # machine-readable code from registry below
+    message: str             # human-readable explanation — always present
+    repo_id: str | None = None   # present for repo-scoped errors (409, 404)
+    details: dict | None = None  # present only for validation_error (422)
+
+# No endpoint may return HTML, a blank body, or an unhandled exception trace.
+# Every non-2xx response uses this shape. No deviations.
+
+8.2 Error Code Registry — Exhaustive
+error code (error field)
+HTTP
+When emitted / Endpoints
+indexing_in_progress
+409
+Non-stale .indexing marker exists.
+Endpoints: POST /ask, POST /impact, GET /repos
+repo_not_found
+404
+./repos/{repo_id}/repo_meta.json absent.
+Endpoints: POST /ask, POST /impact, DELETE /repos/{repo_id}
+job_not_found
+404
+./jobs/{job_id}.json absent.
+Endpoints: GET /status/{job_id}
+zip_too_large
+413
+Compressed > 15 MB OR uncompressed > 200 MB.
+Endpoints: POST /upload
+zip_invalid
+422
+Not a valid ZIP OR zip-slip path detected.
+Endpoints: POST /upload
+validation_error
+422
+Missing or malformed request fields.
+Endpoints: All endpoints
+internal_error
+500
+Unhandled server fault. Always JSON, never HTML.
+Endpoints: All endpoints
+
+This registry is exhaustive. No other error codes exist. No endpoint may emit an error code not in this registry.
+
+8.3 HTTP 200 Degraded Success Contract
+HTTP 200 with llm_fallback_used=true is a DEGRADED SUCCESS — not an error. The frontend must handle it gracefully. The backend never returns 500 due to LLM behavior.
+Degraded success applies to: /ask (claims=[]) and /impact (what_it_does='') when Fallback A fires.
+All other response fields (chunks, confidence_score, confidence_label, risk_level, file_count, files_referencing) are fully populated and accurate in a degraded success response.
+
+SECTION 9 — 21 Failure Cases (Structured & Indexed)
+
+9.0 Failure Case Index
+ID
+Failure Name
+HTTP / Category
+F-01
+ZIP too large — compressed > 15 MB
+413 / Upload validation — hard rejection
+F-02
+ZIP too large — uncompressed > 200 MB
+413 / Upload validation — hard rejection
+F-03
+ZIP invalid — file is not a valid ZIP archive
+422 / Input validation — hard rejection
+F-04
+ZIP path traversal / zip-slip attack
+422 / Input validation — hard rejection
+F-05
+Stale .indexing marker detected and cleaned up
+200 / Infrastructure — silent recovery
+F-06
+Indexing in progress — 409 on POST /ask
+409 / Indexing guard — retryable
+F-07
+Indexing in progress — 409 on POST /impact
+409 / Indexing guard — retryable
+F-08
+Indexing in progress — 409 on GET /repos
+409 / Indexing guard — retryable
+F-09
+Repo not found — repo_meta.json absent (POST /ask)
+404 / Resource not found — hard rejection
+F-10
+Repo not found — repo_meta.json absent (POST /impact)
+404 / Resource not found — hard rejection
+F-11
+Job not found — GET /status/{job_id}
+404 / Resource not found — hard rejection
+F-12
+OpenAI embedding API rate limit or timeout mid-indexing
+200 / Background task failure — job status
+F-13
+Partial indexing then failure — marker cleaned up
+200 / Background task failure — job status
+F-14
+Server restart during active indexing — orphaned marker
+200 / Infrastructure — silent recovery
+F-15
+Chroma collection missing or corrupt on query
+500 / Server error — internal
+F-16
+LLM API call failure — Fallback A
+200 / Degraded success — Fallback A
+F-17
+LLM returns invalid JSON (parse failure) — Fallback A
+200 / Degraded success — Fallback A
+F-18
+LLM returns valid JSON but wrong type — Fallback A
+200 / Degraded success — Fallback A
+F-19
+POST /impact — grep finds no matches
+200 / Degraded success — valid response
+F-20
+POST /impact — definition file detection finds no pattern
+200 / Degraded success — valid response
+F-21
+POST /impact — all definition candidates are test/mock/stub
+200 / Degraded success — valid response
+
+9.1  F-01 — ZIP too large — compressed size exceeds 15 MB
+F-01  ZIP too large — compressed size exceeds 15 MB   HTTP 413
+where_it_happens
+POST /upload — Step 1: content-length check before any extraction
+detection_condition
+Uploaded file content-length (or streamed byte count) exceeds 15,728,640 bytes (15 MB).
+http_status
+413
+response_body
+{ "error":   "zip_too_large",
+  "message": "Compressed upload size exceeds the 15 MB limit.",
+  "repo_id": null,
+  "details": { "limit_bytes": 15728640, "received_bytes": <actual> } }
+frontend_render
+Show an inline upload error: 'File too large. Maximum compressed size is 15 MB.'
+logging
+LOG WARN: upload rejected — compressed size <n> bytes exceeds 15 MB limit; no files written to disk.
+
+9.2  F-02 — ZIP too large — uncompressed content exceeds 200 MB
+F-02  ZIP too large — uncompressed content exceeds 200 MB   HTTP 413
+where_it_happens
+POST /upload — Step 2: ZipInfo sum check before extraction begins
+detection_condition
+Sum of ZipInfo.file_size across all entries exceeds 209,715,200 bytes (200 MB); evaluated before any bytes are extracted.
+http_status
+413
+response_body
+{ "error":   "zip_too_large",
+  "message": "Uncompressed content size exceeds the 200 MB limit.",
+  "repo_id": null,
+  "details": { "limit_bytes": 209715200, "declared_bytes": <sum> } }
+frontend_render
+Show an inline upload error: 'Repository too large. Maximum uncompressed size is 200 MB.'
+logging
+LOG WARN: upload rejected — declared uncompressed size <n> bytes exceeds 200 MB limit; no extraction attempted.
+
+9.3  F-03 — ZIP invalid — file is not a valid ZIP archive
+F-03  ZIP invalid — file is not a valid ZIP archive   HTTP 422
+where_it_happens
+POST /upload — Step 3: ZipFile.open() call
+detection_condition
+zipfile.BadZipFile or equivalent exception raised when opening the uploaded file as a ZIP.
+http_status
+422
+response_body
+{ "error":   "zip_invalid",
+  "message": "Uploaded file is not a valid ZIP archive.",
+  "repo_id": null,
+  "details": null }
+frontend_render
+Show an inline upload error: 'Invalid file. Please upload a .zip archive.'
+logging
+LOG WARN: upload rejected — BadZipFile exception on open; filename=<n>, size=<n> bytes.
+
+9.4  F-04 — ZIP path traversal / zip-slip attack
+F-04  ZIP path traversal / zip-slip attack   HTTP 422
+where_it_happens
+POST /upload — Step 4: per-entry path validation during extraction loop
+detection_condition
+Any ZipInfo entry has an absolute path, contains '..' segments, or resolves outside ./tmp/{job_id}/ after path join.
+http_status
+422
+response_body
+{ "error":   "zip_invalid",
+  "message": "Zip-slip path traversal detected. Upload rejected.",
+  "repo_id": null,
+  "details": { "offending_entry": "<entry_name>" } }
+frontend_render
+Show an inline upload error: 'Upload rejected due to invalid archive structure.'
+logging
+LOG ERROR: zip-slip detected — entry '<n>' resolves outside extraction root; job_id=<id>; partial tmp dir removed.
+
+9.5  F-05 — Stale .indexing marker detected and cleaned up
+F-05  Stale .indexing marker detected and cleaned up   HTTP 200
+where_it_happens
+POST /ask, POST /impact, GET /repos — Step 0: stale-marker cleanup (runs before every 409 check)
+detection_condition
+os.path.getmtime('./repos/{repo_id}/.indexing') returns a value more than 1800 seconds before current time.
+http_status
+200
+response_body
+// NOT an error response. Stale marker is silently deleted.
+// Endpoint then proceeds normally as if no .indexing file existed.
+// If repo_meta.json is present → normal 200 response.
+// If repo_meta.json is absent → 404 repo_not_found.
+// No stale-marker field appears in any response body.
+frontend_render
+Frontend sees no indication of the stale marker; endpoint responds as if indexing never occurred.
+logging
+LOG WARN: stale .indexing marker removed — repo_id=<id>, marker_age=<seconds>s, path=./repos/<id>/.indexing.
+
+9.6  F-06 — Indexing in progress — 409 on POST /ask
+F-06  Indexing in progress — 409 on POST /ask   HTTP 409
+where_it_happens
+POST /ask — Step 1 (after stale cleanup): check for ./repos/{repo_id}/.indexing
+detection_condition
+./repos/{repo_id}/.indexing exists and mtime <= 1800 seconds ago (non-stale).
+http_status
+409
+response_body
+{ "error":   "indexing_in_progress",
+  "message": "Repo is still indexing. Try again soon.",
+  "repo_id": "<repo_id>",
+  "details": null }
+frontend_render
+Show a dismissible banner on the Ask tab: 'Repository is still being indexed. Please wait and try again.'
+logging
+LOG INFO: 409 returned to /ask — repo_id=<id>, .indexing marker present and non-stale.
+
+9.7  F-07 — Indexing in progress — 409 on POST /impact
+F-07  Indexing in progress — 409 on POST /impact   HTTP 409
+where_it_happens
+POST /impact — Step 1 (after stale cleanup): check for ./repos/{repo_id}/.indexing
+detection_condition
+./repos/{repo_id}/.indexing exists and mtime <= 1800 seconds ago (non-stale).
+http_status
+409
+response_body
+{ "error":   "indexing_in_progress",
+  "message": "Repo is still indexing. Try again soon.",
+  "repo_id": "<repo_id>",
+  "details": null }
+frontend_render
+Show a dismissible banner on the Impact tab: 'Repository is still being indexed. Please wait and try again.'
+logging
+LOG INFO: 409 returned to /impact — repo_id=<id>, .indexing marker present and non-stale.
+
+9.8  F-08 — Indexing in progress — 409 on GET /repos
+F-08  Indexing in progress — 409 on GET /repos   HTTP 409
+where_it_happens
+GET /repos — Step 1 (after stale cleanup): scan for any ./repos/*/.indexing
+detection_condition
+Any ./repos/{any_repo_id}/.indexing file exists and mtime <= 1800 seconds ago across all repos.
+http_status
+409
+response_body
+{ "error":   "indexing_in_progress",
+  "message": "Indexing in progress. Try again soon.",
+  "repo_id": null,
+  "details": null }
+// repo_id is null — /repos is a multi-repo gate.
+// Does not identify which repo is indexing.
+frontend_render
+Show a loading spinner or banner on the repo selector: 'Indexing in progress. Repository list unavailable.'
+logging
+LOG INFO: 409 returned to GET /repos — active .indexing marker(s) found across repo directory.
+
+9.9  F-09 — Repo not found — repo_meta.json absent (POST /ask)
+F-09  Repo not found — repo_meta.json absent (POST /ask)   HTTP 404
+where_it_happens
+POST /ask — Step 2 (after stale cleanup and 409 check): check for ./repos/{repo_id}/repo_meta.json
+detection_condition
+os.path.exists('./repos/{repo_id}/repo_meta.json') returns False.
+http_status
+404
+response_body
+{ "error":   "repo_not_found",
+  "message": "Repository not found.",
+  "repo_id": "<repo_id>",
+  "details": null }
+frontend_render
+Show an error state on the Ask tab: 'Repository not found. Please re-upload or select a valid repository.'
+logging
+LOG WARN: 404 /ask — repo_meta.json missing for repo_id=<id>; no Chroma query attempted.
+
+9.10  F-10 — Repo not found — repo_meta.json absent (POST /impact)
+F-10  Repo not found — repo_meta.json absent (POST /impact)   HTTP 404
+where_it_happens
+POST /impact — Step 2 (after stale cleanup and 409 check): check for ./repos/{repo_id}/repo_meta.json
+detection_condition
+os.path.exists('./repos/{repo_id}/repo_meta.json') returns False.
+http_status
+404
+response_body
+{ "error":   "repo_not_found",
+  "message": "Repository not found.",
+  "repo_id": "<repo_id>",
+  "details": null }
+frontend_render
+Show an error state on the Impact tab: 'Repository not found. Please re-upload or select a valid repository.'
+logging
+LOG WARN: 404 /impact — repo_meta.json missing for repo_id=<id>; no grep or Chroma query attempted.
+
+9.11  F-11 — Job not found — GET /status/{job_id}
+F-11  Job not found — GET /status/{job_id}   HTTP 404
+where_it_happens
+GET /status/{job_id} — Step 1: check for ./jobs/{job_id}.json
+detection_condition
+os.path.exists('./jobs/{job_id}.json') returns False.
+http_status
+404
+response_body
+{ "error":   "job_not_found",
+  "message": "No job found with the given ID.",
+  "repo_id": null,
+  "details": null }
+frontend_render
+Show an error in the upload status poller: 'Job ID not found. It may have expired or never existed.'
+logging
+LOG WARN: 404 /status — job file missing for job_id=<id>; may have been cleaned up on startup.
+
+9.12  F-12 — OpenAI embedding API rate limit or timeout mid-indexing
+F-12  OpenAI embedding API rate limit or timeout mid-indexing   HTTP 200
+where_it_happens
+Background indexing task — embedder.py: batch embedding call to text-embedding-3-small
+detection_condition
+openai.RateLimitError, openai.Timeout, httpx.TimeoutException, or equivalent raised during any batch embedding call.
+http_status
+200
+response_body
+// Background task. /upload already returned 202.
+// Job transitions to failed. Job file updated to:
+{ "job_id": "<id>", "repo_id": "<id>",
+  "status": "failed",
+  "chunk_count": <chunks_completed_before_failure>,
+  "error": "Embedding API error: <exception message>" }
+// .indexing is removed. repo_meta.json is NOT written.
+// Partial Chroma upserts remain but repo is inaccessible (no repo_meta.json).
+frontend_render
+Polling /status returns status='failed' and error; show 'Indexing failed: Embedding API error. Please retry upload.'
+logging
+LOG ERROR: embedding batch failed — job_id=<id>, repo_id=<id>, chunks_done=<n>, error=<exception>; .indexing removed; repo_meta.json not written.
+
+9.13  F-13 — Partial indexing then failure — job marked failed, marker cleaned up
+F-13  Partial indexing then failure — job marked failed, marker cleaned up   HTTP 200
+where_it_happens
+Background indexing task — any step after .indexing is created: chunking, embedding, or Chroma upsert
+detection_condition
+Any unhandled exception raised inside the background indexing coroutine after job status has been set to 'indexing'.
+http_status
+200
+response_body
+// Background task only. /upload already returned 202.
+// Cleanup sequence on any indexing failure:
+// 1. Catch exception in top-level try/except.
+// 2. Remove ./repos/{repo_id}/.indexing  (MANDATORY — never leave orphaned).
+// 3. Update ./jobs/{job_id}.json:
+{ "job_id": "<id>", "repo_id": "<id>",
+  "status": "failed",
+  "chunk_count": <last_known>,
+  "error": "<ExceptionClass>: <message>" }
+// 4. Do NOT write repo_meta.json.
+// 5. Partial ./repos/{repo_id}/ and Chroma data remain (inaccessible).
+//    Operator must call DELETE /repos/{repo_id} to clean up.
+frontend_render
+Polling /status shows status='failed'; show 'Indexing failed. Please delete this repository and retry the upload.'
+logging
+LOG ERROR: indexing task failed — job_id=<id>, repo_id=<id>, error=<exc>, .indexing removed, repo_meta.json not written.
+
+9.14  F-14 — Server restart during active indexing — orphaned .indexing marker
+F-14  Server restart during active indexing — orphaned .indexing marker   HTTP 200
+where_it_happens
+App startup + first request to POST /ask, POST /impact, or GET /repos that runs stale-marker cleanup
+detection_condition
+After restart: ./repos/{repo_id}/.indexing exists with mtime > 1800s. Background task is no longer running.
+http_status
+200
+response_body
+// On restart: background task is dead. Job file still shows status="indexing".
+// .indexing has mtime = time of last server stop.
+//
+// First guarded request runs stale-marker cleanup:
+// - .indexing mtime > 1800s → deleted.
+// - repo_meta.json absent (indexing never completed).
+// - Request returns 404 repo_not_found (F-09 or F-10).
+//
+// Job file is NOT auto-updated to "failed" at restart.
+// Remains "indexing" until cleanup rule applies (mtime > 86400s → deleted on next startup).
+// Pre-indexed demo repo is unaffected: it has repo_meta.json.
+frontend_render
+After stale marker cleanup, /ask or /repos responds normally (200 or 404); no special UI beyond standard error rendering.
+logging
+LOG WARN: orphaned .indexing marker cleaned — repo_id=<id>, marker_age=<s>s; no repo_meta.json found; repo treated as not-indexed.
+
+9.15  F-15 — Chroma collection missing or corrupt on query
+F-15  Chroma collection missing or corrupt on query   HTTP 500
+where_it_happens
+POST /ask or POST /impact — Chroma query step (after all guards pass, repo_meta.json present)
+detection_condition
+chromadb.errors.InvalidCollectionException, ValueError, or any exception from collection.query() when repo_{repo_id} collection is absent or HNSW index is corrupt.
+http_status
+500
+response_body
+{ "error":   "internal_error",
+  "message": "Vector store query failed. Repository index may be corrupt.",
+  "repo_id": "<repo_id>",
+  "details": null }
+frontend_render
+Show a full-page error: 'An internal error occurred. The repository index may be corrupt. Please delete and re-upload the repository.'
+logging
+LOG ERROR: Chroma query failed — repo_id=<id>, collection=repo_<id>, error=<exc>; repo_meta.json present but collection missing or corrupt.
+
+9.16  F-16 — LLM API call failure — network error, timeout, or non-200 response
+F-16  LLM API call failure — network error, timeout, or non-200 response   HTTP 200
+where_it_happens
+POST /ask or POST /impact — LLM call step in llm.py (after evidence labeling is complete)
+detection_condition
+openai.APIError, openai.Timeout, httpx.ConnectError, or any exception from the gpt-4o-mini client call.
+http_status
+200
+response_body
+// Fallback A activates. DEGRADED SUCCESS (200), not an error.
+//
+// For /ask:
+{ "repo_id": "<id>", "retrieval_mode": "standard|overview",
+  "confidence_score": 0.58, "confidence_label": "High",
+  "claims": [], "chunks": [ /* full evidence pack */ ],
+  "llm_fallback_used": true }
+//
+// For /impact:
+{ "repo_id": "<id>", "function_name": "<n>",
+  "risk_level": "Medium", "file_count": 2,
+  "files_referencing": ["..."], "what_it_does": "",
+  "message": null, "chunks": [ /* full evidence pack */ ],
+  "llm_fallback_used": true }
+frontend_render
+Render all evidence chunks and citations normally; display a subtle notice: '[AI summary unavailable — showing evidence only]'
+logging
+LOG ERROR: LLM API call failed — endpoint=<ask|impact>, repo_id=<id>, error=<exc>; Fallback A activated; claims=[]; chunks returned normally.
+
+9.17  F-17 — LLM returns invalid JSON (parse failure) — Fallback A
+F-17  LLM returns invalid JSON (parse failure) — Fallback A   HTTP 200
+where_it_happens
+POST /ask or POST /impact — json.loads() call on raw LLM response text in llm.py
+detection_condition
+json.JSONDecodeError raised by json.loads(llm_response_text). Covers: truncated response (token limit), embedded prose, malformed escapes.
+http_status
+200
+response_body
+// Fallback A activates. Same degraded-success shape as F-16.
+// For /ask: claims=[], llm_fallback_used=true.
+// For /impact: what_it_does="", llm_fallback_used=true.
+// All other fields (chunks, confidence, risk_level, file_count) are unaffected.
+// The raw malformed LLM text is NEVER propagated to the client.
+frontend_render
+Render evidence chunks normally; display '[AI summary unavailable — showing evidence only]'
+logging
+LOG WARN: LLM JSON parse failed (JSONDecodeError) — endpoint=<ask|impact>, repo_id=<id>; Fallback A activated; raw_length=<n> chars.
+
+9.18  F-18 — LLM returns syntactically valid JSON but wrong type — Fallback A
+F-18  LLM returns syntactically valid JSON but wrong type — Fallback A   HTTP 200
+where_it_happens
+POST /ask or POST /impact — isinstance() check immediately after json.loads() in llm.py
+detection_condition
+json.loads() succeeds but result is a dict, string, int, or any non-list type. isinstance(parsed, list) is False. ValueError raised inside the try block.
+http_status
+200
+response_body
+// Fallback A activates. Identical shape to F-16 and F-17.
+// Triggering LLM responses:
+//   { "answer": "..." } → dict, not list → Fallback A
+//   "Some prose string" → str, not list → Fallback A
+// Type-check line: if not isinstance(parsed, list): raise ValueError("non-list")
+// claims=[] for /ask, what_it_does="" for /impact, llm_fallback_used=true.
+frontend_render
+Render evidence chunks normally; display '[AI summary unavailable — showing evidence only]'
+logging
+LOG WARN: LLM returned non-list JSON type — endpoint=<ask|impact>, repo_id=<id>, actual_type=<type>; Fallback A activated.
+
+9.19  F-19 — POST /impact — grep finds no matches (zero-match case)
+F-19  POST /impact — grep finds no matches (zero-match case)   HTTP 200
+where_it_happens
+POST /impact — grep scan step in grep.py: word-boundary pattern matches zero source files
+detection_condition
+matching_files set is empty after scanning all filtered source files under ./repos/{repo_id}/.
+http_status
+200
+response_body
+// VALID SUCCESS (200). Not an error.
+{ "repo_id": "demo_repo", "function_name": "parse_token",
+  "risk_level": "Low", "file_count": 0, "files_referencing": [],
+  "what_it_does": "Decodes and validates a JWT string.",
+  "message": "No exact word-boundary grep matches found. Showing semantic evidence only.",
+  "chunks": [ /* vector-only chunks, similarity != null */ ],
+  "llm_fallback_used": false }
+// message is NON-NULL only in this zero-match case.
+// risk_level is always "Low" when file_count == 0.
+// Vector retrieval still runs normally.
+frontend_render
+Render vector evidence and risk badge (Low); display the message field verbatim as an info notice below the risk badge.
+logging
+LOG INFO: /impact grep found zero matches — repo_id=<id>, function_name=<n>; returning vector-only evidence with risk=Low.
+
+9.20  F-20 — POST /impact — definition file detection finds no definition pattern
+F-20  POST /impact — definition file detection finds no definition pattern   HTTP 200
+where_it_happens
+POST /impact — definition_file detection step in grep.py: no file in matching_files contains a definition-pattern match
+detection_condition
+After scanning all files in matching_files with Python and JS/TS definition-pattern regexes, no match found. definition_file = null.
+http_status
+200
+response_body
+// VALID SUCCESS (200). Not an error.
+// definition_file=null means ALL matching_files are in files_referencing.
+// file_count = len(matching_files). risk_level derived from that count.
+{ "repo_id": "demo_repo", "function_name": "SOME_CONSTANT",
+  "risk_level": "Medium", "file_count": 3,
+  "files_referencing": ["a.py", "b.py", "c.py"],
+  "what_it_does": "...", "message": null,
+  "chunks": [ /* ... */ ], "llm_fallback_used": false }
+// definition_file is never exposed in the response body.
+frontend_render
+Render impact results normally; definition detection is fully transparent to the frontend.
+logging
+LOG DEBUG: /impact definition detection found no pattern — repo_id=<id>, function_name=<n>; definition_file=null; all matching files counted as referencing.
+
+9.21  F-21 — POST /impact — all definition candidates are test/mock/stub files
+F-21  POST /impact — all definition candidates are test/mock/stub files   HTTP 200
+where_it_happens
+POST /impact — definition_file selection algorithm step 2 (path-filter elimination)
+detection_condition
+All files with a definition-pattern match have paths containing 'test', 'mock', or 'stub'. Step 2 eliminates all candidates. Algorithm re-runs without path filter (step 5).
+http_status
+200
+response_body
+// VALID SUCCESS (200). Fallback rule applies:
+// Re-run selection without test/mock/stub filter.
+// Pick file with earliest definition-pattern line number (tie-break: shortest path).
+// files_referencing = matching_files - {definition_file}.
+{ "repo_id": "demo_repo", "function_name": "verify_credentials",
+  "risk_level": "Low", "file_count": 1,
+  "files_referencing": ["src/routes.py"],
+  "what_it_does": "...", "message": null,
+  "chunks": [ /* ... */ ], "llm_fallback_used": false }
+frontend_render
+Render impact results normally; this fallback is fully transparent to the frontend.
+logging
+LOG DEBUG: /impact definition detection — all candidates were test/mock/stub; fallback to unfiltered selection; definition_file=<path>; repo_id=<id>.
+
+SECTION 10 — Non-Negotiable Invariants (Complete Table)
+
+Every invariant in this table is absolute. No invariant may be weakened, omitted, or conditioned on runtime state. These rules apply without exception across all code paths, including fallback and degraded paths.
+
+Invariant #
+Rule
+I-01
+Every error response from every endpoint uses the canonical ErrorResponse shape. No endpoint may return HTML, a blank body, or an unhandled exception trace.
+I-02
+The backend never returns HTTP 500 due to LLM output. LLM failures, JSON parse failures, and wrong-type JSON always trigger Fallback A (HTTP 200, llm_fallback_used=true).
+I-03
+Stale .indexing marker cleanup (mtime > 1800s → delete) MUST run before every 409 check. This is mandatory, not optional, not best-effort.
+I-04
+repo_meta.json is the sole existence oracle. repo_meta.json present = repo exists. repo_meta.json absent = 404. No other signal overrides this.
+I-05
+./jobs/{job_id}.json MUST be updated to status=failed AND ./repos/{repo_id}/.indexing MUST be removed when any indexing failure occurs. Neither step may be skipped.
+I-06
+similarity MUST be null (JSON null) for all grep-sourced EvidenceChunk objects. Never 0. Never omitted.
+I-07
+GET /health and GET /status/{job_id} MUST never return 409 under any condition.
+I-08
+Evidence E-labels (E1..Ek) MUST be assigned after the final chunk list is fully frozen (post-dedup, post-sort) and BEFORE the LLM call. This order is absolute.
+I-09
+hnsw:space=cosine MUST be set on every get_or_create_collection() call. Without it, sim=1-d produces invalid values.
+I-10
+The mode field in POST /ask requests is accepted but never read. Backend always auto-detects overview vs standard via keyword matching.
+I-11
+Fallback A MUST catch both json.JSONDecodeError and ValueError (from isinstance check). Both exceptions MUST set claims=[] and llm_fallback_used=True.
+I-12
+Risk level in /impact MUST be derived solely from file_count of files_referencing. LLM output for risk_level is discarded. No exceptions.
+I-13
+Chroma collection names MUST always equal f"repo_{repo_id}". Demo repo collection MUST be repo_demo_repo. No deviations.
+I-14
+The grep context window MUST apply both bounds: start=max(0, match_line-10) AND end=min(len(lines), match_line+10). Both clamps are mandatory.
+I-15
+The definition_file field is an internal implementation detail. It MUST NEVER appear in any response body sent to the client.
+I-16
+No failure case may introduce a new endpoint, new infrastructure component, or new external dependency.
+I-17
+On app startup, job files with status=complete or status=failed AND mtime > 86400s MUST be deleted.
+I-18
+The demo repo seed script MUST check for collection repo_demo_repo (not repo_demo). It MUST NOT reindex if the collection exists and has items.
+I-19
+Zip-slip path traversal detection MUST check every ZipInfo entry before any bytes are extracted. Abort and remove ./tmp/{job_id}/ on detection.
+I-20
+DELETE /repos/{repo_id} has no 409 guard. Deletion proceeds even if .indexing is present. The .indexing file is removed as part of directory deletion.
+
+SECTION 11 — Implementation Order (Deterministic Build Order)
+
+This section specifies the mandatory build order. Each phase must be complete and verified before the next phase begins.
+
+Phase
+Deliverables
+Verification Gate
+Phase 1
+Foundation
+Set up FastAPI + Uvicorn skeleton. Create ./repos/, ./jobs/, ./tmp/, ./chroma_db/ directories. Implement GET /health returning {status:ok}. Implement startup job cleanup. Implement ChromaDB PersistentClient with hnsw:space=cosine.
+GET /health returns 200. ChromaDB directory created. Startup runs without errors.
+Phase 2
+Ingestion Pipeline
+Implement POST /upload: ZIP validation sequence, file filtering, chunking, embedding (text-embedding-3-small, batch 64), Chroma upsert. Implement GET /status/{job_id}. Implement background job lifecycle (start/success/failure marker and job file logic).
+Upload demo_repo.zip. Poll /status until complete. Verify repo_meta.json written. Verify .indexing removed. Verify Chroma collection repo_demo_repo queryable.
+Phase 3
+Repo Management
+Implement GET /repos with full guard sequence (stale cleanup → 409 → list). Implement DELETE /repos/{repo_id} (no 409 guard). Implement repo_id collision handling.
+Upload triggers /repos 409 during indexing. After completion /repos returns list. DELETE removes dir, collection, job files.
+Phase 4
+Ask Intelligence
+Implement POST /ask: guard sequence, overview keyword detection, retrieval with diversity caps, dedup, confidence computation (cosine, sim=1-d), evidence labeling (freeze first), LLM call, Fallback A.
+Standard and overview mode return correct chunk counts. Confidence scores in [0,1]. E-IDs in claims match E-IDs in chunks. Fallback A fires on forced LLM error without 500.
+Phase 5
+Impact Engine
+Implement POST /impact: guard sequence, word-boundary grep, definition detection with test/mock/stub filter and fallback, context-window extraction (both clamps), vector retrieval (top-6), merge, dedup, evidence labeling, LLM what_it_does, Fallback A. Implement zero-match case (message field).
+grep finds referencing files. Risk badge matches file_count. similarity=null for grep chunks. Zero-match returns message. Fallback A fires without 500.
+Phase 6
+Failure Hardening
+Verify all 21 failure cases (Section 9). Test each failure condition in isolation. Verify all F-cases return correct HTTP status and exact ErrorResponse or degraded-success shape. Verify no HTML is ever returned.
+All 21 F-cases pass. No 500 from LLM. No HTML from any endpoint. No crash from any malformed input.
+Phase 7
+Demo Seeding
+Implement seed_demo_repo.py. Verify collection=repo_demo_repo. Verify no reindex if already present. Restart server, verify persistence. Run demo script end-to-end. Test confidence meter. Test Fallback A visually.
+After restart: /ask returns non-empty chunks. Confidence bar renders. Claims click to correct chunks. Risk badge color correct. No crash on any demo path.
+
+This Constitution is the single authoritative implementation contract.
+It fully supersedes all four source documents.
+No feature, endpoint, error code, guard, formula, or invariant may be added, removed, or weakened without producing a new numbered revision.
+This document is final. Execute it.

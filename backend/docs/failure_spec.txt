@@ -1,0 +1,623 @@
+AI CODEBASE GUIDE
+Failure Scenarios + Mitigations Spec  ·  Backend
+AUTHORITY & SCOPE
+Derived exclusively from Combined Backend Master Plan v2 and API Contracts & Schemas Final. No new endpoints or infrastructure. Every failure returns structured JSON matching the canonical ErrorResponse or the degraded-success contract. The backend never produces HTML error pages, blank responses, or unhandled 500s.
+HTTP 200 with llm_fallback_used=true is a DEGRADED SUCCESS — not an error. The frontend must handle it gracefully.
+
+Failure Case Index
+
+ID
+Failure Name
+HTTP
+Category
+F-01
+ZIP too large — compressed size exceeds 15 MB
+413
+Upload validation — hard rejection
+F-02
+ZIP too large — uncompressed content exceeds 200 MB
+413
+Upload validation — hard rejection
+F-03
+ZIP invalid — file is not a valid ZIP archive
+422
+Input validation — hard rejection
+F-04
+ZIP path traversal / zip-slip attack
+422
+Input validation — hard rejection
+F-05
+Stale .indexing marker detected and cleaned up
+200
+Infrastructure — silent recovery
+F-06
+Indexing in progress — 409 on POST /ask
+409
+Indexing guard — retryable
+F-07
+Indexing in progress — 409 on POST /impact
+409
+Indexing guard — retryable
+F-08
+Indexing in progress — 409 on GET /repos
+409
+Indexing guard — retryable
+F-09
+Repo not found — repo_meta.json absent (POST /ask)
+404
+Resource not found — hard rejection
+F-10
+Repo not found — repo_meta.json absent (POST /impact)
+404
+Resource not found — hard rejection
+F-11
+Job not found — GET /status/{job_id}
+404
+Resource not found — hard rejection
+F-12
+OpenAI embedding API rate limit or timeout mid-indexing
+200
+Background task failure — job status
+F-13
+Partial indexing then failure — job marked failed, marker cleaned up
+200
+Background task failure — job status
+F-14
+Server restart during active indexing — orphaned .indexing marker
+200
+Infrastructure — silent recovery
+F-15
+Chroma collection missing or corrupt on query
+500
+Server error — internal
+F-16
+LLM API call failure — network error, timeout, or non-200 response
+200
+Degraded success — Fallback A
+F-17
+LLM returns invalid JSON (parse failure) — Fallback A
+200
+Degraded success — Fallback A
+F-18
+LLM returns syntactically valid JSON but wrong type — Fallback A
+200
+Degraded success — Fallback A
+F-19
+POST /impact — grep finds no matches (zero-match case)
+200
+Degraded success — valid response
+F-20
+POST /impact — definition file detection finds no definition pattern
+200
+Degraded success — valid response
+F-21
+POST /impact — all definition candidates are test/mock/stub files
+200
+Degraded success — valid response
+
+Failure Case Specifications
+
+F-01.  ZIP too large — compressed size exceeds 15 MB    HTTP 413
+where_it_happens
+POST /upload — Step 1: content-length check before any extraction
+detection_condition
+Uploaded file content-length (or streamed byte count) exceeds 15,728,640 bytes (15 MB).
+http_status
+413
+response_body
+{
+  "error":   "zip_too_large",
+  "message": "Compressed upload size exceeds the 15 MB limit.",
+  "repo_id": null,
+  "details": { "limit_bytes": 15728640, "received_bytes": <actual> }
+}
+frontend_render
+Show an inline upload error: 'File too large. Maximum compressed size is 15 MB.'
+logging
+LOG WARN: upload rejected — compressed size <n> bytes exceeds 15 MB limit; no files written to disk.
+
+
+F-02.  ZIP too large — uncompressed content exceeds 200 MB    HTTP 413
+where_it_happens
+POST /upload — Step 2: ZipInfo sum check before extraction begins
+detection_condition
+Sum of ZipInfo.file_size across all entries exceeds 209,715,200 bytes (200 MB); evaluated before any bytes are extracted.
+http_status
+413
+response_body
+{
+  "error":   "zip_too_large",
+  "message": "Uncompressed content size exceeds the 200 MB limit.",
+  "repo_id": null,
+  "details": { "limit_bytes": 209715200, "declared_bytes": <sum> }
+}
+frontend_render
+Show an inline upload error: 'Repository too large. Maximum uncompressed size is 200 MB.'
+logging
+LOG WARN: upload rejected — declared uncompressed size <n> bytes exceeds 200 MB limit; no extraction attempted.
+
+
+F-03.  ZIP invalid — file is not a valid ZIP archive    HTTP 422
+where_it_happens
+POST /upload — Step 3: ZipFile.open() call
+detection_condition
+zipfile.BadZipFile or equivalent exception raised when opening the uploaded file as a ZIP.
+http_status
+422
+response_body
+{
+  "error":   "zip_invalid",
+  "message": "Uploaded file is not a valid ZIP archive.",
+  "repo_id": null,
+  "details": null
+}
+frontend_render
+Show an inline upload error: 'Invalid file. Please upload a .zip archive.'
+logging
+LOG WARN: upload rejected — BadZipFile exception on open; filename=<name>, size=<n> bytes.
+
+
+F-04.  ZIP path traversal / zip-slip attack    HTTP 422
+where_it_happens
+POST /upload — Step 4: per-entry path validation during extraction loop
+detection_condition
+Any ZipInfo entry has an absolute path, contains '..' segments, or resolves outside ./tmp/{job_id}/ after path join.
+http_status
+422
+response_body
+{
+  "error":   "zip_invalid",
+  "message": "Zip-slip path traversal detected. Upload rejected.",
+  "repo_id": null,
+  "details": { "offending_entry": "<entry_name>" }
+}
+frontend_render
+Show an inline upload error: 'Upload rejected due to invalid archive structure.'
+logging
+LOG ERROR: zip-slip detected — entry '<name>' resolves outside extraction root; job_id=<id>; partial tmp dir removed.
+
+
+F-05.  Stale .indexing marker detected and cleaned up    HTTP 200
+where_it_happens
+Any of: POST /ask, POST /impact, GET /repos — Step 0: stale-marker cleanup pass (runs before every 409 check)
+detection_condition
+os.path.getmtime('./repos/{repo_id}/.indexing') returns a value more than 1800 seconds before current time (i.e., marker is > 30 minutes old).
+http_status
+200
+response_body
+// This is NOT an error response.
+// The stale marker is silently deleted.
+// The endpoint then proceeds normally as if no .indexing file existed.
+// If repo_meta.json is present -> normal 200 response.
+// If repo_meta.json is absent -> 404 repo_not_found (see F-08).
+//
+// No stale-marker field is included in any response body.
+frontend_render
+Frontend sees no indication of the stale marker; endpoint responds as if indexing never occurred.
+logging
+LOG WARN: stale .indexing marker removed — repo_id=<id>, marker_age=<seconds>s, path=./repos/<id>/.indexing.
+
+
+F-06.  Indexing in progress — 409 on POST /ask    HTTP 409
+where_it_happens
+POST /ask — Step 0 (after stale cleanup): check for ./repos/{repo_id}/.indexing
+detection_condition
+./repos/{repo_id}/.indexing exists and mtime <= 1800 seconds ago (non-stale).
+http_status
+409
+response_body
+{
+  "error":   "indexing_in_progress",
+  "message": "Repo is still indexing. Try again soon.",
+  "repo_id": "<repo_id>",
+  "details": null
+}
+frontend_render
+Show a dismissible banner on the Ask tab: 'Repository is still being indexed. Please wait and try again.'
+logging
+LOG INFO: 409 returned to /ask — repo_id=<id>, .indexing marker present and non-stale.
+
+
+F-07.  Indexing in progress — 409 on POST /impact    HTTP 409
+where_it_happens
+POST /impact — Step 0 (after stale cleanup): check for ./repos/{repo_id}/.indexing
+detection_condition
+./repos/{repo_id}/.indexing exists and mtime <= 1800 seconds ago (non-stale).
+http_status
+409
+response_body
+{
+  "error":   "indexing_in_progress",
+  "message": "Repo is still indexing. Try again soon.",
+  "repo_id": "<repo_id>",
+  "details": null
+}
+frontend_render
+Show a dismissible banner on the Impact tab: 'Repository is still being indexed. Please wait and try again.'
+logging
+LOG INFO: 409 returned to /impact — repo_id=<id>, .indexing marker present and non-stale.
+
+
+F-08.  Indexing in progress — 409 on GET /repos    HTTP 409
+where_it_happens
+GET /repos — Step 0 (after stale cleanup): scan for any ./repos/*/.indexing
+detection_condition
+Any ./repos/{any_repo_id}/.indexing file exists and mtime <= 1800 seconds ago across all repos.
+http_status
+409
+response_body
+{
+  "error":   "indexing_in_progress",
+  "message": "Indexing in progress. Try again soon.",
+  "repo_id": null,
+  "details": null
+}
+// Note: repo_id is null — /repos is a multi-repo gate.
+// It does not identify which repo is indexing.
+frontend_render
+Show a loading spinner or banner on the repo selector: 'Indexing in progress. Repository list unavailable.'
+logging
+LOG INFO: 409 returned to GET /repos — active .indexing marker(s) found across repo directory.
+
+
+F-09.  Repo not found — repo_meta.json absent (POST /ask)    HTTP 404
+where_it_happens
+POST /ask — Step 1 (after stale cleanup and 409 check): check for ./repos/{repo_id}/repo_meta.json
+detection_condition
+os.path.exists('./repos/{repo_id}/repo_meta.json') returns False.
+http_status
+404
+response_body
+{
+  "error":   "repo_not_found",
+  "message": "Repository not found.",
+  "repo_id": "<repo_id>",
+  "details": null
+}
+frontend_render
+Show an error state on the Ask tab: 'Repository not found. Please re-upload or select a valid repository.'
+logging
+LOG WARN: 404 /ask — repo_meta.json missing for repo_id=<id>; no Chroma query attempted.
+
+
+F-10.  Repo not found — repo_meta.json absent (POST /impact)    HTTP 404
+where_it_happens
+POST /impact — Step 1 (after stale cleanup and 409 check): check for ./repos/{repo_id}/repo_meta.json
+detection_condition
+os.path.exists('./repos/{repo_id}/repo_meta.json') returns False.
+http_status
+404
+response_body
+{
+  "error":   "repo_not_found",
+  "message": "Repository not found.",
+  "repo_id": "<repo_id>",
+  "details": null
+}
+frontend_render
+Show an error state on the Impact tab: 'Repository not found. Please re-upload or select a valid repository.'
+logging
+LOG WARN: 404 /impact — repo_meta.json missing for repo_id=<id>; no grep or Chroma query attempted.
+
+
+F-11.  Job not found — GET /status/{job_id}    HTTP 404
+where_it_happens
+GET /status/{job_id} — Step 1: check for ./jobs/{job_id}.json
+detection_condition
+os.path.exists('./jobs/{job_id}.json') returns False.
+http_status
+404
+response_body
+{
+  "error":   "job_not_found",
+  "message": "No job found with the given ID.",
+  "repo_id": null,
+  "details": null
+}
+frontend_render
+Show an error message in the upload status poller: 'Job ID not found. It may have expired or never existed.'
+logging
+LOG WARN: 404 /status — job file missing for job_id=<id>; may have been cleaned up on startup.
+
+
+F-12.  OpenAI embedding API rate limit or timeout mid-indexing    HTTP 200
+where_it_happens
+Background indexing task — embedder.py: batch embedding call to text-embedding-3-small
+detection_condition
+openai.RateLimitError, openai.Timeout, httpx.TimeoutException, or equivalent network error raised during any batch embedding call.
+http_status
+200
+response_body
+// This failure occurs in a background task.
+// /upload already returned 202. The job transitions to failed.
+//
+// ./jobs/{job_id}.json is updated to:
+{
+  "job_id":      "<id>",
+  "repo_id":     "<id>",
+  "status":      "failed",
+  "chunk_count": <chunks_completed_before_failure>,
+  "error":       "Embedding API error: <exception message>"
+}
+//
+// ./repos/{repo_id}/.indexing is removed.
+// ./repos/{repo_id}/repo_meta.json is NOT written.
+// Partial Chroma upserts remain but repo is not queryable (no repo_meta.json).
+frontend_render
+Polling /status/{job_id} returns status='failed' and error message; show 'Indexing failed: Embedding API error. Please retry upload.'
+logging
+LOG ERROR: embedding batch failed — job_id=<id>, repo_id=<id>, chunks_done=<n>, error=<exception>; .indexing marker removed; repo_meta.json not written.
+
+
+F-13.  Partial indexing then failure — job marked failed, marker cleaned up    HTTP 200
+where_it_happens
+Background indexing task — any step after .indexing is created: chunking, embedding, or Chroma upsert
+detection_condition
+Any unhandled exception or explicit failure condition raised inside the background indexing coroutine after job status has been set to 'indexing'.
+http_status
+200
+response_body
+// Background task only. /upload already returned 202.
+//
+// Cleanup sequence on any indexing failure:
+// 1. Catch exception in top-level try/except of background task.
+// 2. Remove ./repos/{repo_id}/.indexing  (mandatory — never leave marker orphaned).
+// 3. Update ./jobs/{job_id}.json:
+{
+  "job_id":      "<id>",
+  "repo_id":     "<id>",
+  "status":      "failed",
+  "chunk_count": <last_known_count>,
+  "error":       "<exception class>: <message>"
+}
+// 4. Do NOT write repo_meta.json.
+// 5. Partial ./repos/{repo_id}/ directory and partial Chroma data remain.
+//    They are inaccessible because repo_meta.json is absent (404 oracle).
+//    Operator must manually DELETE /repos/{repo_id} to clean up.
+frontend_render
+Polling /status shows status='failed' with error string; show 'Indexing failed. Please delete this repository and retry the upload.'
+logging
+LOG ERROR: indexing task failed — job_id=<id>, repo_id=<id>, error=<exc>, .indexing removed, repo_meta.json not written.
+
+
+F-14.  Server restart during active indexing — orphaned .indexing marker    HTTP 200
+where_it_happens
+App startup + next request to POST /ask, POST /impact, or GET /repos that triggers stale-marker cleanup
+detection_condition
+After restart: ./repos/{repo_id}/.indexing exists with mtime > 1800 seconds ago. The background task that created it is no longer running.
+http_status
+200
+response_body
+// On restart:
+// - The background indexing task is dead.
+// - The job file ./jobs/{job_id}.json still shows status="indexing".
+// - ./repos/{repo_id}/.indexing has mtime = time of last server stop.
+//
+// First request that runs stale-marker cleanup (F-05 rule):
+// - Finds .indexing with mtime > 1800s -> deletes it.
+// - repo_meta.json is absent (indexing never completed).
+// - Request returns 404 repo_not_found (see F-09 or F-10).
+//
+// Job file is NOT auto-updated to "failed" at restart.
+// It remains "indexing" until the job file cleanup rule applies
+// (mtime > 86400s -> deleted on next startup).
+//
+// Pre-indexed demo repo is unaffected: it has repo_meta.json.
+frontend_render
+After the stale marker is cleaned, /ask or /repos returns normally (200 or 404); no special UI required beyond the standard error rendering.
+logging
+LOG WARN: orphaned .indexing marker cleaned at stale-marker check — repo_id=<id>, marker_age=<s>s; no repo_meta.json found; repo treated as not-indexed.
+
+
+F-15.  Chroma collection missing or corrupt on query    HTTP 500
+where_it_happens
+POST /ask or POST /impact — Chroma query step (after guards pass, repo_meta.json exists)
+detection_condition
+chromadb.errors.InvalidCollectionException, ValueError, or any exception raised by collection.query() when the collection named repo_{repo_id} does not exist in the persistent store or its HNSW index is corrupt.
+http_status
+500
+response_body
+{
+  "error":   "internal_error",
+  "message": "Vector store query failed. Repository index may be corrupt.",
+  "repo_id": "<repo_id>",
+  "details": null
+}
+frontend_render
+Show a full-page error state: 'An internal error occurred. The repository index may be corrupt. Please delete and re-upload the repository.'
+logging
+LOG ERROR: Chroma query failed — repo_id=<id>, collection=repo_<id>, error=<exc>; repo_meta.json present but collection missing or corrupt.
+
+
+F-16.  LLM API call failure — network error, timeout, or non-200 response    HTTP 200
+where_it_happens
+POST /ask or POST /impact — LLM call step in llm.py (after evidence labeling is complete)
+detection_condition
+openai.APIError, openai.Timeout, httpx.ConnectError, or any exception raised by the LLM client during the gpt-4o-mini call.
+http_status
+200
+response_body
+// Fallback A activates. This is a DEGRADED SUCCESS (200), not an error.
+//
+// For /ask:
+{
+  "repo_id":           "<id>",
+  "retrieval_mode":    "standard|overview",
+  "confidence_score":  0.58,
+  "confidence_label":  "High",
+  "claims":            [],
+  "chunks":            [ /* full evidence pack, unchanged */ ],
+  "llm_fallback_used": true
+}
+//
+// For /impact:
+{
+  "repo_id":           "<id>",
+  "function_name":     "<name>",
+  "risk_level":        "Medium",
+  "file_count":        2,
+  "files_referencing": [ "..." ],
+  "what_it_does":      "",
+  "message":           null,
+  "chunks":            [ /* full evidence pack, unchanged */ ],
+  "llm_fallback_used": true
+}
+frontend_render
+Render all evidence chunks and citations normally; display a subtle notice: '[AI summary unavailable — showing evidence only]'
+logging
+LOG ERROR: LLM API call failed — endpoint=<ask|impact>, repo_id=<id>, error=<exc>; Fallback A activated; claims=[]; chunks returned normally.
+
+
+F-17.  LLM returns invalid JSON (parse failure) — Fallback A    HTTP 200
+where_it_happens
+POST /ask or POST /impact — json.loads() call on raw LLM response text in llm.py
+detection_condition
+json.JSONDecodeError raised by json.loads(llm_response_text). Covers: truncated response (token limit hit), embedded prose before/after JSON, malformed escape sequences.
+http_status
+200
+response_body
+// Fallback A activates. Same degraded-success shape as F-16.
+//
+// For /ask: claims=[], llm_fallback_used=true.
+// For /impact: what_it_does="", llm_fallback_used=true.
+// All other fields (chunks, confidence, risk_level, file_count) are unaffected.
+//
+// The backend NEVER propagates the raw malformed LLM text to the client.
+frontend_render
+Render evidence chunks normally; display '[AI summary unavailable — showing evidence only]'
+logging
+LOG WARN: LLM JSON parse failed (JSONDecodeError) — endpoint=<ask|impact>, repo_id=<id>; Fallback A activated; raw_length=<n> chars logged at DEBUG level.
+
+
+F-18.  LLM returns syntactically valid JSON but wrong type — Fallback A    HTTP 200
+where_it_happens
+POST /ask or POST /impact — isinstance() check immediately after json.loads() in llm.py
+detection_condition
+json.loads() succeeds but returns a dict, string, int, or any non-list type. isinstance(parsed, list) is False. A ValueError is raised inside the try block to trigger the except handler.
+http_status
+200
+response_body
+// Fallback A activates. Identical shape to F-16 and F-17.
+//
+// Example triggering responses from LLM:
+//   { "answer": "...", "evidence": ["E1"] }  -> dict, not list -> Fallback A
+//   "Some prose string"                       -> str, not list -> Fallback A
+//
+// The type-check line that triggers this:
+//   if not isinstance(parsed, list): raise ValueError("non-list")
+//
+// claims=[] for /ask, what_it_does="" for /impact, llm_fallback_used=true.
+frontend_render
+Render evidence chunks normally; display '[AI summary unavailable — showing evidence only]'
+logging
+LOG WARN: LLM returned non-list JSON type — endpoint=<ask|impact>, repo_id=<id>, actual_type=<type>; Fallback A activated.
+
+
+F-19.  POST /impact — grep finds no matches (zero-match case)    HTTP 200
+where_it_happens
+POST /impact — grep scan step in grep.py: pattern matches zero files in ./repos/{repo_id}/
+detection_condition
+The set matching_files is empty after scanning all filtered source files with the word-boundary regex.
+http_status
+200
+response_body
+// This is a VALID SUCCESS response (200). It is not an error.
+{
+  "repo_id":           "demo_repo",
+  "function_name":     "parse_token",
+  "risk_level":        "Low",
+  "file_count":        0,
+  "files_referencing": [],
+  "what_it_does":      "Decodes and validates a JWT string.",
+  "message":           "No exact word-boundary grep matches found. Showing semantic evidence only.",
+  "chunks":            [ /* vector-only evidence chunks, similarity != null */ ],
+  "llm_fallback_used": false
+}
+// message is non-null ONLY in this case.
+// risk_level is always "Low" when file_count == 0.
+// Vector retrieval still runs. what_it_does still populated if LLM succeeds.
+frontend_render
+Render vector evidence chunks and risk badge (Low); display the message field text verbatim as an info notice below the risk badge.
+logging
+LOG INFO: /impact grep found zero matches — repo_id=<id>, function_name=<name>; returning vector-only evidence with risk=Low.
+
+
+F-20.  POST /impact — definition file detection finds no definition pattern    HTTP 200
+where_it_happens
+POST /impact — definition_file detection step in grep.py: no file in matching_files contains a definition-pattern match
+detection_condition
+After scanning all files in matching_files with Python and JS/TS definition-pattern regexes, no match is found. definition_file is set to null.
+http_status
+200
+response_body
+// This is a VALID SUCCESS response (200). It is not an error.
+// definition_file = null means ALL matching_files count as referencing files.
+// file_count = len(matching_files).
+// risk_level is derived from that file_count as normal.
+//
+// Example: function_name="SOME_CONSTANT" matches in 3 files,
+// but no def/class/function declaration found in any of them.
+{
+  "repo_id":           "demo_repo",
+  "function_name":     "SOME_CONSTANT",
+  "risk_level":        "Medium",
+  "file_count":        3,
+  "files_referencing": ["a.py", "b.py", "c.py"],
+  "what_it_does":      "...",
+  "message":           null,
+  "chunks":            [ /* ... */ ],
+  "llm_fallback_used": false
+}
+// definition_file is an internal implementation detail.
+// It is never exposed in the response body.
+frontend_render
+Render the impact results normally; no special UI required — definition detection is fully transparent to the frontend.
+logging
+LOG DEBUG: /impact definition detection found no definition pattern — repo_id=<id>, function_name=<name>; definition_file=null; all matching files counted as referencing.
+
+
+F-21.  POST /impact — all definition candidates are test/mock/stub files    HTTP 200
+where_it_happens
+POST /impact — definition_file selection algorithm step 2 (MR-4 fix): path-filter elimination
+detection_condition
+All files with a definition-pattern match have paths containing 'test', 'mock', or 'stub' (case-insensitive). Step 2 eliminates all candidates. Step 5 of the algorithm re-runs without the path filter.
+http_status
+200
+response_body
+// VALID SUCCESS (200). Fallback rule applies:
+// Re-run definition candidate selection without test/mock/stub filter.
+// Pick the file with the earliest definition-pattern line number.
+// Tie-break: shortest path. This becomes definition_file.
+// files_referencing = matching_files - {definition_file}.
+//
+// Response shape is identical to the normal /impact 200 response.
+// definition_file (a test file) is still excluded from files_referencing.
+// This may slightly undercount risk — acceptable per spec.
+{
+  "repo_id":           "demo_repo",
+  "function_name":     "verify_credentials",
+  "risk_level":        "Low",
+  "file_count":        1,
+  "files_referencing": ["src/routes.py"],
+  "what_it_does":      "...",
+  "message":           null,
+  "chunks":            [ /* ... */ ],
+  "llm_fallback_used": false
+}
+frontend_render
+Render impact results normally; no special UI required — this fallback is fully transparent to the frontend.
+logging
+LOG DEBUG: /impact definition detection — all candidates were test/mock/stub paths; fallback to unfiltered selection; definition_file=<path>; repo_id=<id>.
+
+Non-Negotiable Invariants
+
+	•	1. Every error response uses the canonical ErrorResponse shape. No deviations.
+	•	2. The backend never returns HTML, a blank body, or an unhandled exception trace to the client.
+	•	3. Fallback A (F-16, F-17, F-18) always returns HTTP 200 with llm_fallback_used=true. It never returns 500.
+	•	4. Stale .indexing marker cleanup (F-05) runs BEFORE every 409 check. This is mandatory, not optional.
+	•	5. repo_meta.json is the sole existence oracle for every repo. No repo_meta.json = 404. Always.
+	•	6. The job file ./jobs/{job_id}.json is ALWAYS updated to status=failed and .indexing ALWAYS removed when any indexing failure occurs (F-12, F-13).
+	•	7. similarity=null for all grep-sourced chunks. Never 0. Never omitted. (F-19, F-20, F-21 all preserve this.)
+	•	8. /health and /status/{job_id} never return 409 under any condition.
+	•	9. Evidence E-labels are assigned after the final chunk list is frozen and before the LLM call, in all code paths including degraded/fallback paths.
+	•	10. No failure case introduces a new endpoint, new infrastructure component, or new external dependency.
