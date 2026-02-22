@@ -1,2 +1,5 @@
 /backend/chroma_db/
 /backend/jobs/
+/backend/.env/
+/backend/.env.local/
+/backend/.env*
