@@ -1,0 +1,658 @@
+AI CODEBASE GUIDE
+Final API Contracts & Schemas  ·  Derived from Combined Backend Master Plan v2
+AUTHORITY: This document derives exclusively from Combined Backend Master Plan v2.
+Every rule, field, constraint, and ordering requirement matches that plan exactly.
+No features have been added. No rules have been relaxed. This is final.
+
+1. Canonical Error Model
+
+Every error response from every endpoint uses this single shape. No endpoint deviates from it.
+
+1.1 Universal Error Body
+// Pydantic model
+class ErrorResponse(BaseModel):
+    error: str          # machine-readable error code, e.g. "indexing_in_progress"
+    message: str        # human-readable explanation
+    repo_id: str | None = None   # present when error is repo-scoped
+    details: dict | None = None  # present for 422 field-level errors only
+
+1.2 Error Code Registry
+The following table is exhaustive. No other error codes exist.
+
+error code
+HTTP
+Endpoints that can emit it
+When emitted
+indexing_in_progress
+409
+/ask  /impact  /repos
+Non-stale .indexing marker exists for relevant repo (or any repo for /repos)
+repo_not_found
+404
+/ask  /impact  /repos/{repo_id}  DELETE /repos/{repo_id}
+repo_meta.json absent for the given repo_id
+job_not_found
+404
+/status/{job_id}
+No job file at ./jobs/{job_id}.json
+zip_too_large
+413
+/upload
+Compressed size > 15 MB or uncompressed size > 200 MB
+zip_invalid
+422
+/upload
+File is not a valid ZIP, or zip-slip path detected
+validation_error
+422
+All endpoints
+Missing or malformed request fields (FastAPI default schema validation)
+internal_error
+500
+All endpoints
+Unhandled server fault. Always returns JSON, never a blank screen or HTML page.
+
+Stale .indexing marker rule (must be applied before every 409 check):
+Before checking for a .indexing file, scan all ./repos/*/. indexing files.
+For any whose mtime > 1800 seconds (30 min): delete the file.
+Only then check for the remaining .indexing files.
+An absent or freshly-deleted marker means no indexing is in progress for that repo.
+
+2. Endpoint Contracts
+
+2.1  GET /health
+
+Always returns 200. No guards. No repo checks. No indexing checks. Never returns 409.
+
+Request
+No request body. No path parameters. No query parameters.
+
+Success Response — 200 OK
+class HealthResponse(BaseModel):
+    status: Literal["ok"]
+// Example response
+{ "status": "ok" }
+
+Error Responses
+None. This endpoint cannot error.
+
+2.2  GET /repos
+
+Request
+No request body. No path parameters. No query parameters.
+
+Success Response — 200 OK
+class RepoListItem(BaseModel):
+    repo_id:    str
+    name:       str         # original zip filename
+    chunk_count: int
+    indexed_at: str         # ISO 8601 UTC, e.g. '2026-02-21T12:00:00Z'
+
+# Response body is a JSON array of RepoListItem
+List[RepoListItem]
+// Example response
+[
+  {
+    "repo_id":     "demo_repo",
+    "name":        "demo_repo.zip",
+    "chunk_count": 1234,
+    "indexed_at":  "2026-02-21T08:00:00Z"
+  }
+]
+
+Error Responses
+HTTP
+error code
+Body / Notes
+409
+indexing_in_progress
+{ "error": "indexing_in_progress", "message": "Indexing in progress. Try again soon." }
+500
+internal_error
+{ "error": "internal_error", "message": "..." }
+
+409 guard logic for /repos:
+1. Run stale-marker cleanup (delete .indexing files with mtime > 1800s).
+2. Scan ./repos/*/. indexing for any remaining (non-stale) marker.
+3. If any found: return 409. repo_id is NOT included (multi-repo gate).
+4. If none found: scan ./repos/*/repo_meta.json and return list.
+
+2.3  POST /upload
+
+Request — multipart/form-data
+# Field name: file
+# Content-Type: multipart/form-data
+# The uploaded file must be a ZIP archive.
+
+# FastAPI signature equivalent:
+async def upload(file: UploadFile = File(...)): ...
+// Example curl
+curl -X POST /upload -F "file=@my_repo.zip"
+
+Success Response — 202 Accepted
+class UploadResponse(BaseModel):
+    job_id:  str   # UUID4
+    repo_id: str   # derived from filename, sanitized
+    status:  Literal["indexing"]
+// Example response
+{
+  "job_id":  "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+  "repo_id": "my_repo",
+  "status":  "indexing"
+}
+
+Error Responses
+HTTP
+error code
+Body / Notes
+413
+zip_too_large
+{ "error": "zip_too_large", "message": "Compressed size exceeds 15 MB limit." }
+413
+zip_too_large
+{ "error": "zip_too_large", "message": "Uncompressed size exceeds 200 MB limit." }
+422
+zip_invalid
+{ "error": "zip_invalid",   "message": "File is not a valid ZIP archive." }
+422
+zip_invalid
+{ "error": "zip_invalid",   "message": "Zip-slip path detected and rejected." }
+422
+validation_error
+{ "error": "validation_error", "message": "No file provided.", "details": {...} }
+500
+internal_error
+{ "error": "internal_error", "message": "..." }
+
+Size check order (both checks are mandatory):
+1. Reject immediately if uploaded content-length > 15 MB (compressed).
+2. Open ZIP, sum ZipInfo.file_size for all entries. If total > 200 MB: reject 413.
+3. Extract to ./tmp/{job_id}/. After extraction, recheck on-disk bytes <= 200 MB.
+4. Move filtered files to ./repos/{repo_id}/.
+Response is returned immediately (202). Indexing runs in background.
+
+2.4  GET /status/{job_id}
+
+Always works. Never returns 409. Not blocked by indexing state.
+
+Request
+# Path parameter
+job_id: str   # UUID4 string
+// Example: GET /status/f47ac10b-58cc-4372-a567-0e02b2c3d479
+
+Success Response — 200 OK
+class JobStatusResponse(BaseModel):
+    job_id:      str
+    repo_id:     str
+    status:      Literal["indexing", "complete", "failed"]
+    chunk_count: int           # 0 during indexing, final count on complete
+    error:       str | None    # null unless status == 'failed'
+// Example — indexing in progress
+{
+  "job_id":      "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+  "repo_id":     "my_repo",
+  "status":      "indexing",
+  "chunk_count": 412,
+  "error":       null
+}
+
+// Example — complete
+{
+  "job_id":      "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+  "repo_id":     "my_repo",
+  "status":      "complete",
+  "chunk_count": 1847,
+  "error":       null
+}
+
+Error Responses
+HTTP
+error code
+Body / Notes
+404
+job_not_found
+{ "error": "job_not_found", "message": "No job found with the given ID." }
+500
+internal_error
+{ "error": "internal_error", "message": "..." }
+
+2.5  POST /ask
+
+Request Schema
+class AskRequest(BaseModel):
+    repo_id:  str
+    question: str
+    mode:     str = "auto"   # Accepted but NEVER READ. Backend always auto-detects.
+// Example request
+{
+  "repo_id":  "demo_repo",
+  "question": "How does authentication work?",
+  "mode":     "auto"
+}
+
+Success Response — 200 OK
+class Claim(BaseModel):
+    claim:    str
+    evidence: List[str]   # E-IDs from the frozen chunk list, e.g. ['E1', 'E3']
+
+class EvidenceChunk(BaseModel):
+    evidence_id: str            # 'E1' through 'Ek', assigned AFTER list is frozen
+    file_path:   str            # relative to repo root
+    start_line:  int
+    end_line:    int
+    text:        str
+    similarity:  float | None   # float for vector; null for grep-sourced (SA-2)
+    source:      Literal["vector", "grep"]
+
+class AskResponse(BaseModel):
+    repo_id:           str
+    retrieval_mode:    Literal["standard", "overview"]
+    confidence_score:  float     # round(mean(similarities), 2), range [0.0, 1.0]
+    confidence_label:  Literal["High", "Medium", "Low"]
+    claims:            List[Claim]       # [] if llm_fallback_used
+    chunks:            List[EvidenceChunk]
+    llm_fallback_used: bool
+// Example response (standard mode)
+{
+  "repo_id":          "demo_repo",
+  "retrieval_mode":   "standard",
+  "confidence_score": 0.61,
+  "confidence_label": "High",
+  "claims": [
+    { "claim": "JWT tokens are verified in the auth middleware.",
+      "evidence": ["E1", "E3"] }
+  ],
+  "chunks": [
+    { "evidence_id": "E1",
+      "file_path":   "src/auth/middleware.py",
+      "start_line":  42,
+      "end_line":    85,
+      "text":        "def verify_jwt(token): ...",
+      "similarity":  0.7812,
+      "source":      "vector" },
+    { "evidence_id": "E2",
+      "file_path":   "src/auth/routes.py",
+      "start_line":  10,
+      "end_line":    52,
+      "text":        "router = APIRouter(...) ...",
+      "similarity":  0.6344,
+      "source":      "vector" }
+  ],
+  "llm_fallback_used": false
+}
+
+Error Responses
+HTTP
+error code
+Body / Notes
+409
+indexing_in_progress
+{ "error": "indexing_in_progress", "repo_id": "demo_repo", "message": "Repo is still indexing. Try again soon." }
+404
+repo_not_found
+{ "error": "repo_not_found", "repo_id": "demo_repo", "message": "Repository not found." }
+422
+validation_error
+{ "error": "validation_error", "message": "...", "details": {...} }
+500
+internal_error
+{ "error": "internal_error", "message": "..." }
+
+Guard order for /ask (must execute in this exact sequence):
+1. Stale-marker cleanup: delete ./repos/{repo_id}/.indexing if mtime > 1800s.
+2. 409 check: if ./repos/{repo_id}/.indexing exists, return 409.
+3. 404 check: if ./repos/{repo_id}/repo_meta.json absent, return 404.
+4. Proceed with retrieval.
+
+Evidence labeling and LLM call ordering (CB-1 fix — non-negotiable):
+Step 1: Finalize chunk list (post-dedup, post-diversity-cap, post-sort).
+Step 2: Assign E1..Ek labels in final list order. E1 = index 0, Ek = last.
+Step 3: Build LLM prompt embedding the labeled chunk texts.
+Step 4: Call LLM. The LLM receives and must cite only the E-IDs from step 2.
+Violation of this order produces evidence ID mismatch and breaks all citations.
+
+Overview detection — canonical keyword list (SA-1 fix):
+Case-insensitive substring match on stripped question string.
+Keywords: overview | summarize | summary | explain the codebase | what does this repo |
+          high level | high-level | architecture | walkthrough | overall structure
+Any single match triggers overview mode. No model call. No extra latency.
+
+Fallback A — LLM failure handling (CB-3 fix):
+try:
+    parsed = json.loads(llm_response_text)
+    if not isinstance(parsed, list): raise ValueError('non-list')
+    claims = parsed
+except (json.JSONDecodeError, ValueError):
+    claims = []
+    llm_fallback_used = True
+Backend NEVER raises 500 due to LLM output. chunks and confidence_score are always returned.
+
+Confidence computation — mechanical only (CB-4 fix):
+Requires hnsw:space=cosine on every Chroma collection.
+sim_i = 1 - chroma_distance_i   (valid only with cosine distance)
+confidence_score = round(mean([sim_1 ... sim_k]), 2)
+confidence_label: >= 0.55 = High | >= 0.35 = Medium | < 0.35 = Low
+Frontend must show warning banner when confidence_label == 'Low'.
+
+2.6  POST /impact
+
+Request Schema
+class ImpactRequest(BaseModel):
+    repo_id:       str
+    function_name: str   # raw identifier, e.g. 'verify_credentials'
+// Example request
+{
+  "repo_id":       "demo_repo",
+  "function_name": "verify_credentials"
+}
+
+Success Response — 200 OK
+class ImpactResponse(BaseModel):
+    repo_id:           str
+    function_name:     str
+    risk_level:        Literal["Low", "Medium", "High"]  # mechanical only
+    file_count:        int          # len(files_referencing), excludes definition file
+    files_referencing: List[str]    # relative paths, excludes definition file
+    what_it_does:      str          # LLM summary; '' if fallback triggered
+    message:           str | None   # non-null only when grep finds nothing
+    chunks:            List[EvidenceChunk]  # grep chunks first, then vector
+    llm_fallback_used: bool
+
+# EvidenceChunk is the same model as in AskResponse.
+# similarity MUST be null for source=='grep'. Never 0, never omitted.
+// Example response — grep found matches
+{
+  "repo_id":       "demo_repo",
+  "function_name": "verify_credentials",
+  "risk_level":    "Medium",
+  "file_count":    2,
+  "files_referencing": ["src/auth/routes.py", "tests/test_auth.py"],
+  "what_it_does":  "Validates username/password against the user store...",
+  "message":       null,
+  "chunks": [
+    { "evidence_id": "E1",
+      "file_path":   "src/auth/routes.py",
+      "start_line":  18,
+      "end_line":    38,
+      "text":        "result = verify_credentials(user, pw) ...",
+      "similarity":  null,
+      "source":      "grep" },
+    { "evidence_id": "E2",
+      "file_path":   "src/auth/middleware.py",
+      "start_line":  5,
+      "end_line":    47,
+      "text":        "def verify_credentials(username, password): ...",
+      "similarity":  0.7341,
+      "source":      "vector" }
+  ],
+  "llm_fallback_used": false
+}
+
+// Example response — grep found nothing
+{
+  "repo_id":       "demo_repo",
+  "function_name": "parse_token",
+  "risk_level":    "Low",
+  "file_count":    0,
+  "files_referencing": [],
+  "what_it_does":  "Decodes and validates a JWT string...",
+  "message":       "No exact word-boundary grep matches found. Showing semantic evidence only.",
+  "chunks": [ ... ],
+  "llm_fallback_used": false
+}
+
+Error Responses
+HTTP
+error code
+Body / Notes
+409
+indexing_in_progress
+{ "error": "indexing_in_progress", "repo_id": "demo_repo", "message": "Repo is still indexing. Try again soon." }
+404
+repo_not_found
+{ "error": "repo_not_found", "repo_id": "demo_repo", "message": "Repository not found." }
+422
+validation_error
+{ "error": "validation_error", "message": "...", "details": {...} }
+500
+internal_error
+{ "error": "internal_error", "message": "..." }
+
+Guard order for /impact (identical to /ask):
+1. Stale-marker cleanup: delete ./repos/{repo_id}/.indexing if mtime > 1800s.
+2. 409 check: if ./repos/{repo_id}/.indexing exists, return 409.
+3. 404 check: if ./repos/{repo_id}/repo_meta.json absent, return 404.
+4. Proceed with grep + vector pipeline.
+
+Risk level computation — mechanical only:
+file_count = len(files_referencing)  [referencing files; definition file excluded]
+0 or 1 files -> Low | 2 or 3 files -> Medium | 4+ files -> High
+LLM never sets, suggests, or influences risk_level. The LLM risk_level field (if
+present in LLM output) is discarded. risk_level in the response always comes from
+the grep file_count computation above.
+
+Evidence merge and labeling order for /impact:
+1. Build grep chunks (context-windowed, bounds-clamped: start=max(0,line-10), end=min(len,line+10)).
+2. Embed function_name -> query Chroma top-6 (no diversity cap on /impact).
+3. Merge. Deduplicate by (file_path, start_line, end_line). Keep first occurrence.
+4. Order: grep evidence first, then vector evidence.
+5. FREEZE list. Assign E1..En labels in order.
+6. Build LLM prompt AFTER step 5. LLM call happens AFTER labeling.
+
+2.7  DELETE /repos/{repo_id}
+
+Request
+# Path parameter only
+repo_id: str
+// Example: DELETE /repos/demo_repo
+
+Success Response — 200 OK
+class DeleteResponse(BaseModel):
+    deleted:  bool    # always true on success
+    repo_id:  str
+// Example response
+{ "deleted": true, "repo_id": "demo_repo" }
+
+Deletion scope
+	•	Delete directory tree: ./repos/{repo_id}/
+	•	Delete Chroma collection: repo_{repo_id}
+	•	Delete job files: any ./jobs/{job_id}.json where repo_id matches (best-effort).
+
+Error Responses
+HTTP
+error code
+Body / Notes
+404
+repo_not_found
+{ "error": "repo_not_found", "repo_id": "demo_repo", "message": "Repository not found." }
+500
+internal_error
+{ "error": "internal_error", "message": "..." }
+
+No 409 guard on DELETE. Deletion may proceed even if indexing is in progress.
+If .indexing file exists at deletion time: delete it along with the rest of the directory.
+If Chroma collection does not exist: silently skip that step (not an error).
+
+3. Core Shared Models
+
+3.1  EvidenceChunk
+class EvidenceChunk(BaseModel):
+    """
+    Shared by AskResponse and ImpactResponse.
+    Used for both vector and grep evidence chunks.
+    """
+    evidence_id: str
+    # Format: 'E1', 'E2', ... 'Ek'
+    # Assigned in final list order AFTER the chunk list is fully frozen.
+    # LLM call occurs AFTER labels are assigned. Never before.
+
+    file_path:   str
+    # Path relative to repo root. No leading slash.
+    # Example: 'src/auth/middleware.py'
+
+    start_line:  int
+    # 0-indexed line number of first line of chunk.
+
+    end_line:    int
+    # 0-indexed line number of last line of chunk (inclusive).
+
+    text:        str
+    # Raw text content of the chunk (or grep context window).
+
+    similarity:  float | None
+    # For source='vector': round(1 - chroma_cosine_distance, 4). Range [0.0, 1.0].
+    # For source='grep':   MUST be null. Never 0. Never omitted.
+
+    source:      Literal["vector", "grep"]
+    # 'vector' = retrieved from ChromaDB embedding search.
+    # 'grep'   = retrieved via word-boundary regex match on source files.
+
+3.2  AskResponse
+class Claim(BaseModel):
+    claim:    str        # LLM-generated claim string
+    evidence: List[str]  # Subset of ['E1'..'Ek'] from frozen chunk list
+    # All evidence IDs must exist in the accompanying chunks array.
+    # LLM is constrained to cite only E-IDs it was given in the prompt.
+
+class AskResponse(BaseModel):
+    repo_id:           str
+    retrieval_mode:    Literal["standard", "overview"]
+    # 'standard': 8 chunks returned, soft diversity cap 4/file.
+    # 'overview': 20 chunks returned, hard diversity cap 2/file.
+
+    confidence_score:  float
+    # round(mean([1-d for each selected chunk distance]), 2)
+    # Requires hnsw:space=cosine. Range: [0.0, 1.0].
+
+    confidence_label:  Literal["High", "Medium", "Low"]
+    # High: confidence_score >= 0.55
+    # Medium: 0.35 <= confidence_score < 0.55
+    # Low: confidence_score < 0.35  [frontend shows warning banner]
+
+    claims:            List[Claim]
+    # Empty list ([]) when llm_fallback_used == True.
+    # Non-empty only when LLM returned valid JSON list.
+
+    chunks:            List[EvidenceChunk]
+    # Final frozen list. Length: 1..8 (standard) or 1..20 (overview).
+    # E-IDs in this list are the only valid citation targets for claims.
+
+    llm_fallback_used: bool
+    # True if: LLM call failed, JSON parse failed, or parsed result was not a list.
+    # When True: claims=[], chunks and confidence still populated normally.
+
+3.3  ImpactResponse
+class ImpactResponse(BaseModel):
+    repo_id:           str
+    function_name:     str
+
+    risk_level:        Literal["Low", "Medium", "High"]
+    # MECHANICAL ONLY. Derived from file_count (referencing files only).
+    # 0-1 -> Low | 2-3 -> Medium | 4+ -> High
+    # LLM output is never used to set this field.
+
+    file_count:        int
+    # Count of files_referencing. Does NOT include the definition file.
+
+    files_referencing: List[str]
+    # Relative paths of files containing a word-boundary grep match,
+    # excluding the definition file (if detected).
+
+    what_it_does:      str
+    # LLM summary of the function based on evidence chunks only.
+    # Empty string ('') when llm_fallback_used == True.
+
+    message:           str | None
+    # Non-null only when grep finds zero matching files.
+    # Value: "No exact word-boundary grep matches found. Showing semantic evidence only."
+    # null in all other cases.
+
+    chunks:            List[EvidenceChunk]
+    # Grep chunks first (similarity=null), then vector chunks.
+    # Max 2 grep context windows per referencing file.
+    # Up to 6 vector chunks (no diversity cap on /impact).
+    # Deduplicated by (file_path, start_line, end_line).
+    # E1..En assigned AFTER list is frozen. LLM call after labeling.
+
+    llm_fallback_used: bool
+    # Same Fallback A semantics as AskResponse.
+    # When True: what_it_does='', chunks still populated normally.
+
+3.4  RepoListItem
+class RepoListItem(BaseModel):
+    repo_id:     str   # sanitized identifier, e.g. 'demo_repo'
+    name:        str   # original zip filename, e.g. 'demo_repo.zip'
+    chunk_count: int   # total chunks in Chroma collection
+    indexed_at:  str   # ISO 8601 UTC timestamp, e.g. '2026-02-21T08:00:00Z'
+
+# Source of truth: ./repos/{repo_id}/repo_meta.json
+# A repo is considered to exist IFF repo_meta.json is present.
+# Absence of repo_meta.json -> 404 for all repo-scoped endpoints.
+
+3.5  JobStatusResponse
+class JobStatusResponse(BaseModel):
+    job_id:      str
+    repo_id:     str
+    status:      Literal["indexing", "complete", "failed"]
+    chunk_count: int
+    # During indexing: current progress count (updated periodically).
+    # On complete:     final total chunk count.
+    # On failed:       last known count before failure (may be 0).
+    error:       str | None
+    # null unless status == 'failed'.
+    # Contains the error message string on failure.
+
+# Source of truth: ./jobs/{job_id}.json
+# Persists across server restarts.
+# Cleanup: job files with status complete|failed and mtime > 86400s
+#          are deleted on app startup.
+
+3.6  UploadResponse
+class UploadResponse(BaseModel):
+    job_id:  str                  # UUID4
+    repo_id: str                  # sanitized, derived from filename
+    status:  Literal["indexing"]  # always "indexing" at response time
+
+3.7  ErrorResponse (canonical)
+class ErrorResponse(BaseModel):
+    error:   str
+    message: str
+    repo_id: str | None = None
+    details: dict | None = None
+    # error: machine-readable code from the Error Code Registry (Section 1.2).
+    # message: human-readable explanation, always present.
+    # repo_id: present only for repo-scoped errors (409, 404 repo errors).
+    # details: present only for validation_error (422); contains field-level info.
+
+4. Inviolable Rules Quick-Reference
+
+The following rules may not be altered, relaxed, or reinterpreted during implementation.
+
+Rule
+Specification
+Chroma distance
+hnsw:space=cosine on EVERY get_or_create_collection() call. This is a pre-condition for sim=1-d to be valid.
+sim formula
+sim = 1 - chroma_cosine_distance. Result is in [0.0, 1.0].
+Confidence
+mean(sims of selected chunks), rounded to 2 decimals. Labels: >=0.55 High, >=0.35 Medium, <0.35 Low.
+Risk
+file_count of files_referencing only. 0-1=Low, 2-3=Medium, 4+=High. LLM never influences this.
+Evidence labeling
+Freeze list -> assign E-labels -> build LLM prompt. This order is mandatory.
+Fallback A
+json.loads() + isinstance(result, list) check. Either failure -> claims=[], llm_fallback_used=True. Never 500.
+similarity on grep
+null. Never 0. Never omitted.
+Stale marker
+mtime > 1800s -> delete before every 409 check.
+Repo oracle
+repo_meta.json presence = repo exists. Absence = 404.
+mode field
+Accepted in request, never read. Backend always auto-detects.
+/health & /status
+Never return 409. Never blocked by indexing state.
+Collection name
+f'repo_{repo_id}' always. seed_demo_repo.py uses repo_demo_repo.
+
+This document is final. All contracts match Combined Backend Master Plan v2 exactly.

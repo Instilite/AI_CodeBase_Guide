@@ -1,0 +1,7 @@
+{
+  "job_id": "775d892b-b08e-46c0-a76f-ded11c4d70cd",
+  "repo_id": "empty_repo",
+  "status": "failed",
+  "chunk_count": 0,
+  "error": "OpenAIError: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable"
+}

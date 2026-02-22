@@ -1,0 +1,387 @@
+AI CODEBASE GUIDE
+Combined Backend Master Plan  ·  Patched v2  ·  48-Hour Hackathon MVP
+
+PATCH STATUS: All CB-1 through CB-4 critical blockers fixed. All MR-1 through MR-4 medium risks fixed. All SA-1 through SA-5 spec ambiguities resolved deterministically.
+This document supersedes all prior drafts. Every rule is final. No further negotiation.
+
+A0. Non-Negotiables and Locked Decisions
+A0.1 Stack (locked)
+Component
+Decision
+Runtime
+FastAPI + Uvicorn (Python 3.11+)
+Vector DB
+ChromaDB PersistentClient(path="./chroma_db") — local only, persists across restarts
+Chroma distance
+cosine (REQUIRED: hnsw:space=cosine on every collection — see CB-4 fix)
+Embeddings
+text-embedding-3-small (OpenAI, no substitutes)
+LLM
+gpt-4o-mini, response_format=JSON (strict JSON output)
+No-go list
+No reranking, no extra providers, no AST parsing
+
+A0.2 Behavior Locks
+Ask behavior:
+	•	Standard ask: retrieve 8 evidence chunks, returned to UI.
+	•	Overview ask: retrieve 20 evidence chunks, hard cap max 2 chunks per file.
+	•	Backend auto-detects overview vs standard — frontend never forces mode.
+
+Confidence (mechanical):
+	•	Chroma cosine distances → similarities via sim = 1 - d.
+	•	Average similarities of selected chunks → round to 2 decimals.
+	•	Thresholds: >= 0.55 = High | >= 0.35 = Medium | < 0.35 = Low.
+
+Impact behavior:
+	•	Risk is mechanical from grep file_count only. LLM never influences risk_level.
+	•	Grep uses word-boundary regex: r"\b" + re.escape(function_name) + r"\b".
+
+Indexing / 409 rules:
+	•	/ask, /impact, /repos return 409 during indexing (see A0.3 for stale marker rule).
+	•	/health and /status/{job_id} always work regardless of indexing state.
+
+LLM failure behavior (Fallback A):
+	•	If LLM call fails OR response JSON fails parse OR parsed result is not a list: return claims=[], llm_fallback_used=true, still return chunks + confidence. Never throw 500.
+
+A0.3 Stale .indexing Marker Rule (CB-2 fix)
+CRITICAL: Orphaned markers permanently block /repos if not cleaned up.
+Rule: At the top of every function that checks for a .indexing file (including /repos, /ask guard, /impact guard), first scan for .indexing files whose mtime > 1800 seconds (30 minutes). For each such file: delete it. Then proceed with the check. An absent or freshly-deleted marker means no indexing in progress for that repo.
+
+A1. Backend Filesystem Layout
+All paths are relative to the backend working directory.
+
+Path
+Purpose
+./repos/{repo_id}/
+Extracted, filtered source files for grep and chunking
+./repos/{repo_id}/.indexing
+Marker: exists iff indexing currently in progress. mtime > 30 min = orphaned, delete.
+./repos/{repo_id}/repo_meta.json
+Repo existence oracle. Presence = repo is ready. Absence = 404.
+./jobs/{job_id}.json
+Job status. Persists across restart. Cleaned up on startup (see A0 SA-5 rule).
+./chroma_db/
+Chroma PersistentClient data directory. Must survive restart.
+./tmp/{job_id}/
+Temporary extraction directory. Removed after successful move.
+
+repo_meta.json schema:
+{ "repo_id": "...", "name": "....zip", "indexed_at": "2026-02-21T12:00:00Z", "chunk_count": 1234 }
+
+jobs/{job_id}.json schema:
+{ "job_id": "...", "repo_id": "...", "status": "indexing|complete|failed", "error": null, "chunk_count": 0 }
+
+Repo existence check (SA-3 fix): Before any query in /ask, /impact, or /repos/{repo_id}, check ./repos/{repo_id}/repo_meta.json existence. If absent, return 404 immediately.
+
+Startup job cleanup (SA-5 fix): On app startup, scan ./jobs/. Delete any job file where status is 'complete' or 'failed' AND file mtime > 86400 seconds (24 hours).
+
+A2. Repo IDs and Job IDs
+repo_id derivation:
+	•	base = Path(upload.filename).stem
+	•	sanitize: lowercase, replace spaces with _, keep [a-z0-9_-], trim to 48 chars
+	•	if collision exists, suffix _{shorthash} from sha1(filename + timestamp)[:8]
+
+job_id: UUID4, always unique, stored at ./jobs/{job_id}.json.
+
+Chroma collection naming rule (canonical): collection name always equals f"repo_{repo_id}". No exceptions. The seed script must use this convention.
+
+A3. Ingestion and Indexing Pipeline (Person 1)
+A3.1 Endpoints
+Endpoint
+Behavior
+POST /upload
+multipart/form-data, field 'file' is zip. Returns immediately: { job_id, repo_id, status: 'indexing' }
+GET /status/{job_id}
+Always works, even during indexing. Returns: { job_id, repo_id, status, chunk_count, error }
+GET /repos
+Returns 409 if any non-stale .indexing marker exists. Else returns list of repo_meta.json entries.
+DELETE /repos/{repo_id}
+Deletes ./repos/{repo_id}/, Chroma collection repo_{repo_id}, and any job files referencing repo_id.
+
+A3.2 ZIP Safety Rules
+	•	Compressed size > 15 MB: reject 413 immediately.
+	•	Before extraction: sum ZipInfo uncompressed sizes. If > 200 MB: reject 413.
+	•	Zip-slip protection: deny absolute paths, deny .. segments, deny weird drive prefixes. Construct safe destination path, verify it stays inside temp dir.
+	•	Extract to ./tmp/{job_id}/. After extraction, verify total on-disk bytes <= 200 MB. Then move filtered files to ./repos/{repo_id}/.
+
+A3.3 File Filtering
+	•	Keep extensions: .py .js .ts .tsx .jsx .css .html .md .go .java .rb .rs .cpp .c .h
+	•	Skip directories anywhere in path: .git node_modules dist build __pycache__ .venv venv
+	•	Skip binaries: if first 8 KB of file contains NUL byte, skip.
+
+A3.4 Chunking
+	•	Split each file into chunks of 100 lines with 20-line overlap.
+	•	Chunk metadata: repo_id, file_path (relative to repo root), start_line, end_line, chunk_index (0..n-1), sha1(text)[:8].
+
+A3.5 Embedding and Chroma Storage
+	•	Model: text-embedding-3-small. Batch size: 64 chunks per request.
+	•	Collection creation (REQUIRED — CB-4 fix):
+collection = client.get_or_create_collection(
+    name=f"repo_{repo_id}",
+    metadata={"hnsw:space": "cosine"}  # REQUIRED: enables sim = 1-d formula
+)
+	•	Chunk IDs: f"{file_path}:{chunk_index}:{sha1[:8]}"
+	•	Upsert: ids, documents (chunk text), metadatas (file_path, start_line, end_line, chunk_index, repo_id), embeddings.
+	•	After restart: PersistentClient must see same collection and queries must work.
+
+A3.6 Background Job Lifecycle
+At indexing start:
+	•	Create ./repos/{repo_id}/.indexing
+	•	Write ./jobs/{job_id}.json with status=indexing
+
+During indexing:
+	•	Periodically update job file with chunk_count progress.
+
+On success:
+	•	Remove ./repos/{repo_id}/.indexing
+	•	Write ./repos/{repo_id}/repo_meta.json with final chunk_count and indexed_at (ISO 8601 UTC).
+	•	Update job file: status=complete.
+
+On failure:
+	•	Remove ./repos/{repo_id}/.indexing
+	•	Update job file: status=failed, error=<message string>.
+
+409 enforcement: /ask, /impact, /repos perform stale-marker cleanup first (A0.3), then check for .indexing on the relevant repo (or any repo for /repos).
+
+A4. Intelligence Layer (Person 2)
+A4.1 POST /ask
+Request schema
+{ "repo_id": "demo_repo", "question": "How does auth work?", "mode": "auto" }
+mode field: accepted but never read. Backend always auto-detects. This is final (SA-4 fix).
+
+Response schema
+{ "repo_id": "...",
+  "retrieval_mode": "standard|overview",
+  "confidence_score": 0.42,
+  "confidence_label": "High|Medium|Low",
+  "claims": [{ "claim": "...", "evidence": ["E1", "E3"] }],
+  "chunks": [
+    { "evidence_id": "E1", "file_path": "src/auth.py",
+      "start_line": 10, "end_line": 42,
+      "text": "...", "similarity": 0.61, "source": "vector" }
+  ],
+  "llm_fallback_used": false }
+
+A4.1a Indexing Guard
+	•	Perform stale-marker cleanup (A0.3) first.
+	•	If ./repos/{repo_id}/.indexing exists: return 409 { "error": "indexing_in_progress", "repo_id": "...", "message": "Repo is still indexing. Try again soon." }
+	•	If ./repos/{repo_id}/repo_meta.json absent: return 404 { "error": "repo_not_found", "repo_id": "..." }
+
+A4.1b Overview Detection (SA-1 fix)
+Canonical keyword list (case-insensitive substring match on stripped question):
+overview, summarize, summary, explain the codebase, what does this repo, high level, high-level, architecture, walkthrough, overall structure
+Any match -> overview mode. No other detection logic. No model call. is_overview_query(question: str) -> bool.
+
+A4.1c Retrieval and Diversity (MR-1 fix)
+Overview mode:
+	•	Query Chroma with n_results=60 (internal).
+	•	Deduplicate by (file_path, start_line). Keep first occurrence per pair.
+	•	Select up to 20 chunks with hard cap max 2 per file. Never exceed 20.
+	•	If fewer than 20 remain after dedup and cap, return however many are available.
+
+Standard mode:
+	•	Query Chroma with n_results=12 (internal).
+	•	Deduplicate by (file_path, start_line). Keep first occurrence per pair.
+	•	Select up to 8 chunks with soft cap max 4 per file.
+	•	If 8 cannot be filled: relax cap to 5, then relax cap entirely (no cap).
+	•	If still fewer than 8 after full relaxation, return however many are available (minimum 1).
+	•	Do not pad with duplicates under any circumstance.
+
+A4.1d Confidence Computation (mechanical — CB-4 fix)
+FINAL RULE: confidence is computed from the selected (final) chunk list only.
+1. For each selected chunk: sim = 1 - chroma_distance  (valid only with hnsw:space=cosine)
+2. avg = mean(all sims in selected list)
+3. confidence_score = round(avg, 2)
+4. Labels: >= 0.55 = High | >= 0.35 = Medium | < 0.35 = Low
+5. Frontend shows warning banner if confidence_label = Low.
+
+A4.1e Evidence Labeling (CB-1 fix)
+CRITICAL ORDERING RULE:
+Step 1: Finalize chunk list (post-dedup, post-diversity-cap, post-sort).
+Step 2: Assign E1..Ek labels in final list order. E1 = first chunk, Ek = last chunk.
+Step 3: Build LLM prompt using labeled list. LLM call happens AFTER labeling.
+The LLM prompt MUST include all chunk texts with their E-labels.
+Claims returned by LLM must only reference E-IDs present in this labeled list.
+Violation of this ordering causes evidence ID mismatch. There are no exceptions.
+
+A4.1f LLM Call — Strict JSON Claims (Fallback A)
+Prompt hard constraints in system message:
+	•	"Use only the provided evidence chunks."
+	•	"Every claim must cite at least one evidence ID from E1..Ek."
+	•	"Return valid JSON array only: [{\"claim\": \"...\", \"evidence\": [\"E1\", \"E3\"]}]. No other keys. No prose."
+
+Fallback A — failure handling (CB-3 fix):
+try:
+    raw = llm_response_text
+    parsed = json.loads(raw)
+    if not isinstance(parsed, list):
+        raise ValueError('LLM returned non-list JSON')
+    claims = parsed
+except (json.JSONDecodeError, ValueError):
+    claims = []
+    llm_fallback_used = True
+This block catches: truncated JSON, syntactically valid but wrong-type JSON, any other parse failure. Backend never raises 500 due to LLM output.
+
+A4.2 POST /impact
+Request schema
+{ "repo_id": "demo_repo", "function_name": "verify_credentials" }
+
+Response schema
+{ "repo_id": "...", "function_name": "...",
+  "risk_level": "Low|Medium|High",
+  "file_count": 2,
+  "files_referencing": ["auth/routes.py", "tests/test_auth.py"],
+  "what_it_does": "...",
+  "message": null,
+  "chunks": [
+    { "evidence_id": "E1", "file_path": "...",
+      "start_line": 10, "end_line": 42,
+      "text": "...", "source": "grep|vector",
+      "similarity": 0.44 }  // null for grep-sourced chunks (SA-2 fix)
+  ],
+  "llm_fallback_used": false }
+
+SA-2 FIX: similarity field for grep-sourced chunks must be null (JSON null), never 0 or omitted. Frontend renders null as —.
+
+A4.2a Indexing Guard
+	•	Same as A4.1a: stale cleanup first, then 409 check, then 404 check.
+
+A4.2b Word-Boundary Grep (mechanical)
+pattern = re.compile(r"\b" + re.escape(function_name) + r"\b")
+	•	Scan all kept source files under ./repos/{repo_id}/.
+	•	Collect matching_files set (files containing at least one match).
+
+A4.2c Definition File Detection (MR-4 fix)
+Heuristic patterns:
+	•	Python: ^\s*def\s+{name}\s*\( and ^\s*class\s+{name}\s*[\(:]
+	•	JS/TS: ^\s*function\s+{name}\s*\( and ^\s*(export\s+)?(const|let|var)\s+{name}\s*=\s*(async\s*)?\( and ^\s*(export\s+default\s+)?class\s+{name}\b
+
+Selection algorithm (MR-4 fix):
+	•	Among files in matching_files, find those with a definition-pattern match.
+	•	Filter out any file whose path contains the substrings 'test', 'mock', or 'stub' (case-insensitive).
+	•	Among remaining candidates, find the first line where a definition pattern fires in each file.
+	•	Pick the file with the earliest such line number. Tie-break: shortest file path string.
+	•	If no candidates remain after step 2 (all are test/mock/stub files), use the candidate with the earliest line number without the path filter.
+	•	If no definition-pattern match found at all: definition_file = null.
+
+Result:
+	•	files_referencing = matching_files - {definition_file}  (set difference, definition_file may be null)
+	•	file_count = len(files_referencing)
+
+A4.2d Mechanical Risk Level
+file_count (referencing files)
+risk_level
+0 or 1
+Low
+2 or 3
+Medium
+4 or more
+High
+
+Risk is derived from file_count of files_referencing only. LLM never sets or influences risk_level. The LLM risk_level field in its output is informational only and is not used.
+
+A4.2e Grep Context Window (MR-3 fix)
+	•	For each referencing file, for first up to 2 grep matches:
+start = max(0, match_line - 10)
+end = min(len(lines), match_line + 10)
+chunk_text = '\n'.join(lines[start:end])
+	•	Negative indices are impossible with this clamp. Both bounds are always applied.
+
+A4.2f Grep Finds Nothing
+	•	If matching_files is empty: file_count=0, files_referencing=[], risk_level="Low".
+	•	message = "No exact word-boundary grep matches found. Showing semantic evidence only."
+	•	Still return vector chunks and LLM what_it_does (if available).
+
+A4.2g Evidence Merge and Labeling
+Order of operations:
+	•	Build grep evidence chunks (context-windowed, bounds-clamped per A4.2e).
+	•	Embed function_name with text-embedding-3-small.
+	•	Query Chroma for top 6 chunks (no diversity cap on /impact).
+	•	Merge: deduplicate by (file_path, start_line, end_line). Keep first occurrence.
+	•	Order: grep evidence first, then vector evidence.
+	•	Freeze final list. Assign E1..En labels in order (same rule as A4.1e).
+	•	Build LLM prompt with labeled list AFTER step 6.
+
+similarity for grep chunks: null. similarity for vector chunks: round(1 - chroma_distance, 4).
+
+A4.2h LLM what_it_does
+	•	LLM produces what_it_does as a summary of evidence only.
+	•	Fallback A applies (same json.loads + isinstance check). If fails: what_it_does = "", llm_fallback_used = true.
+	•	LLM output never alters risk_level or file_count.
+
+A5. Error Response Policy
+All error responses return JSON. No blank screens. No HTML error pages.
+
+HTTP Code
+Condition and Body
+409
+{ "error": "indexing_in_progress", "repo_id": "...", "message": "Repo is still indexing. Try again soon." }
+404
+{ "error": "repo_not_found", "repo_id": "..." }
+413
+{ "error": "zip_too_large", "message": "Compressed or uncompressed size exceeds limit." }
+422
+{ "error": "validation_error", "message": "...", "details": {...} }
+500
+{ "error": "internal_error", "message": "..."}  — never a crash, never blank
+
+A6. Demo Seeding and Persistence
+Rev 2 requires a pre-indexed demo repo and persistent Chroma across restart.
+
+A6.1 seed_demo_repo.py (MR-2 fix)
+Collection name fix: collection is repo_demo_repo (not repo_demo).
+Rule: collection name always equals f"repo_{repo_id}". demo repo_id = demo_repo. Collection = repo_demo_repo.
+
+Script logic:
+	•	Connect: client = chromadb.PersistentClient(path="./chroma_db")
+	•	Check: try client.get_collection(name="repo_demo_repo"). If exists and count > 0: skip, exit.
+	•	If absent or empty: run full ingestion pipeline on demo repo directory.
+	•	Verify: after indexing, get_collection("repo_demo_repo").count() > 0. Assert true.
+
+App startup behavior (dev mode):
+	•	Do NOT reindex if collection already exists and has items.
+	•	Only verify collection exists and is queryable.
+	•	Run startup job cleanup (A1, SA-5 fix).
+
+A6.2 Pass Condition
+	•	After server restart: ./repos/demo_repo/ exists.
+	•	Chroma collection repo_demo_repo exists and is queryable.
+	•	/ask { "repo_id": "demo_repo", "question": "..." } returns non-empty chunks.
+
+A7. Complete Deterministic Rules Summary
+This section is the canonical reference. All implementation must match these rules exactly.
+
+Rule
+Final Specification
+Evidence labeling
+Freeze chunk list FIRST (post-dedup, post-sort). Assign E1..Ek in list order. LLM call happens AFTER labeling. No exceptions.
+Confidence computation
+sim = 1-d for each selected chunk. avg = mean(sims). score = round(avg, 2). >=0.55=High, >=0.35=Medium, <0.35=Low. Uses cosine distance (hnsw:space=cosine required).
+Risk computation
+file_count = len(files_referencing). 0-1=Low, 2-3=Medium, 4+=High. LLM never sets risk. Purely mechanical.
+Indexing guard logic
+Stale cleanup (mtime > 1800s) runs FIRST on every guard check. Then check .indexing existence. 409 if present. 404 if repo_meta.json absent.
+LLM fallback (Fallback A)
+try json.loads(). If exception OR result is not a list: claims=[], llm_fallback_used=True. Return chunks + confidence unchanged. Never 500.
+Definition file detection
+Filter test/mock/stub paths. Among remainder, earliest definition-pattern line number. Tie-break: shortest path. If all filtered: re-run without path filter. Null if no definition pattern found.
+Grep context window
+start = max(0, match_line - 10). end = min(len(lines), match_line + 10). Always both clamps.
+Standard mode diversity
+Dedup by (file_path, start_line) first. Select 8, cap 4/file. Relax to 5, then no cap. Never pad with duplicates. Return minimum 1.
+Overview keyword list
+Case-insensitive substring: overview, summarize, summary, explain the codebase, what does this repo, high level, high-level, architecture, walkthrough, overall structure. Any match = overview mode.
+mode field in /ask
+Accepted but never read. Backend always auto-detects. Ignored.
+similarity for grep chunks
+null (JSON null). Never 0. Never omitted. Frontend renders as —.
+repo_id existence check
+Check ./repos/{repo_id}/repo_meta.json. Absent = 404. Applied before all logic in /ask, /impact, /repos/{repo_id}.
+Chroma collection name
+Always f"repo_{repo_id}". Seed script must use repo_demo_repo for demo_repo.
+hnsw:space
+cosine on every get_or_create_collection() call. This is required for sim=1-d to be valid.
+Job file cleanup
+On startup: delete job files with status complete or failed where mtime > 86400s.
+
+This document is final. All rules are deterministic. No 'should', no 'recommended', no 'maybe'. Execute it.
