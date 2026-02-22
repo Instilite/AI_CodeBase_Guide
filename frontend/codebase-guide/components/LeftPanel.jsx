@@ -5,10 +5,21 @@ import AskTab from './AskTab'
 import ImpactTab from './ImpactTab'
 import RightPanel from './RightPanel'
 
-export default function LeftPanel() {
+export default function LeftPanel({ selectedRepoId, disabledReason }) {
   const [activeTab, setActiveTab] = useState('ask')
   const [evidence, setEvidence] = useState([])
   const [totalFiles, setTotalFiles] = useState(null)
+  const [activeEvidenceId, setActiveEvidenceId] = useState(null)
+
+  const handleEvidenceUpdate = (nextEvidence) => {
+    setEvidence(Array.isArray(nextEvidence) ? nextEvidence : [])
+    setActiveEvidenceId(null)
+  }
+
+  const handleImpactEvidenceUpdate = (nextEvidence) => {
+    setTotalFiles(null)
+    handleEvidenceUpdate(nextEvidence)
+  }
 
   return (
     <>
@@ -29,14 +40,31 @@ export default function LeftPanel() {
         </div>
 
         <div style={{ display: activeTab === 'ask' ? 'flex' : 'none', flexDirection: 'column', flex: 1 }}>
-  <AskTab onEvidenceUpdate={setEvidence} onFilesUpdate={setTotalFiles} />
-</div>
-<div style={{ display: activeTab === 'impact' ? 'block' : 'none' }}>
-  <ImpactTab />
-</div>
+          <AskTab
+            selectedRepoId={selectedRepoId}
+            disabledReason={disabledReason}
+            onEvidenceUpdate={handleEvidenceUpdate}
+            onFilesUpdate={setTotalFiles}
+            onEvidenceSelect={setActiveEvidenceId}
+          />
+        </div>
+
+        <div style={{ display: activeTab === 'impact' ? 'flex' : 'none', flexDirection: 'column', flex: 1 }}>
+          <ImpactTab
+            selectedRepoId={selectedRepoId}
+            disabledReason={disabledReason}
+            onEvidenceUpdate={handleImpactEvidenceUpdate}
+            onEvidenceSelect={setActiveEvidenceId}
+          />
+        </div>
       </div>
 
-      <RightPanel evidence={evidence} totalFiles={totalFiles} />
+      <RightPanel
+        evidence={evidence}
+        totalFiles={totalFiles}
+        activeEvidenceId={activeEvidenceId}
+        onEvidenceSelect={setActiveEvidenceId}
+      />
     </>
   )
 }
