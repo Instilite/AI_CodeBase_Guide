@@ -1,2 +1,0 @@
-"""Grep module placeholder."""
-

@@ -45,6 +45,9 @@ from store import (
     upsert_batch,
 )
 
+from dotenv import load_dotenv
+load_dotenv()
+
 
 BASE_DIR = Path(".")
 REPOS_DIR = BASE_DIR / "repos"
