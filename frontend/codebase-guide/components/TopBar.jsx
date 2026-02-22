@@ -1,80 +1,117 @@
 'use client'
 
-import { useRef, useState } from 'react'
+import { useMemo, useRef } from 'react'
 
-export default function TopBar({ theme, toggleTheme }) {
+export default function TopBar({
+  theme,
+  toggleTheme,
+  backendStatus,
+  repos,
+  selectedRepoId,
+  onSelectRepo,
+  onUpload,
+  uploadState,
+  currentJob,
+  reposLoading,
+  onDeleteRepo,
+  onRefreshRepos,
+}) {
   const fileInputRef = useRef(null)
-  const [uploadState, setUploadState] = useState('idle')
-  const [uploadMessage, setUploadMessage] = useState('')
+
+  const healthLabel = useMemo(() => {
+    if (backendStatus === 'online') return 'Backend Online'
+    if (backendStatus === 'offline') return 'Backend Offline'
+    return 'Checking Backend'
+  }, [backendStatus])
+
+  const uploadLabel = useMemo(() => {
+    if (uploadState.status === 'uploading') return 'Uploading...'
+    if (uploadState.status === 'indexing') return 'Indexing...'
+    return 'Upload Repo'
+  }, [uploadState.status])
+
+  const chunkProgress = currentJob?.status === 'indexing'
+    ? `${currentJob.chunk_count || 0} chunks`
+    : null
+
+  const uploadDisabled = uploadState.status === 'uploading' || uploadState.status === 'indexing'
+  const canDelete = Boolean(selectedRepoId) && !uploadDisabled
+  const repoSelectorDisabled = backendStatus !== 'online' || reposLoading || repos.length === 0
 
   const handleUpload = async (e) => {
     const files = e.target.files
     if (!files || files.length === 0) return
-
-    setUploadState('uploading')
-    setUploadMessage(`Uploading ${files.length} file${files.length > 1 ? 's' : ''}...`)
-
-    try {
-      const formData = new FormData()
-      for (const file of files) {
-        formData.append('files', file)
-      }
-
-      const response = await fetch('/api/upload', {
-        method: 'POST',
-        body: formData,
-      })
-
-      const result = await response.json()
-
-      if (!response.ok) {
-        throw new Error(result.error || 'Upload failed')
-      }
-
-      setUploadState('success')
-      setUploadMessage(`✓ ${result.fileCount} file${result.fileCount > 1 ? 's' : ''} uploaded`)
-
-      // Store sessionId so Ask can reference these files later
-      localStorage.setItem('uploadSessionId', result.sessionId)
-
-      setTimeout(() => {
-        setUploadState('idle')
-        setUploadMessage('')
-      }, 3000)
-
-    } catch (error) {
-      console.error('Upload error:', error)
-      setUploadState('error')
-      setUploadMessage(`✗ ${error.message}`)
-      setTimeout(() => {
-        setUploadState('idle')
-        setUploadMessage('')
-      }, 3000)
-    }
-
+    await onUpload(files[0])
     e.target.value = ''
   }
 
+  const handleDelete = async () => {
+    if (!selectedRepoId || !canDelete) return
+    const confirmed = window.confirm(`Delete repo "${selectedRepoId}"?`)
+    if (!confirmed) return
+    await onDeleteRepo(selectedRepoId)
+  }
+
+  const handleRefreshClick = async () => {
+    await onRefreshRepos({ preferredRepoId: selectedRepoId })
+  }
+
   const getUploadButtonStyle = () => {
-    if (uploadState === 'success') return { borderColor: 'var(--green)', color: 'var(--green)' }
-    if (uploadState === 'error')   return { borderColor: '#f55050', color: '#f55050' }
-    if (uploadState === 'uploading') return { opacity: 0.6, cursor: 'wait' }
+    if (uploadState.status === 'success') return { borderColor: 'var(--green)', color: 'var(--green)' }
+    if (uploadState.status === 'error') return { borderColor: '#f55050', color: '#f55050' }
+    if (uploadDisabled) return { opacity: 0.7, cursor: 'wait' }
     return {}
   }
+
+  const healthClass =
+    backendStatus === 'online' ? 'health-pill health-pill-online'
+      : backendStatus === 'offline' ? 'health-pill health-pill-offline'
+        : 'health-pill'
+
+  const showSpinner = uploadState.status === 'uploading' || uploadState.status === 'indexing'
+  const statusMessage = uploadState.message || (reposLoading ? 'Refreshing repos...' : '')
 
   return (
     <header className="topbar">
       <div className="logo-badge">CG</div>
-      <span className="topbar-title" style={{ color: '#ffffff' }}>Codebase Guide</span>
+      <span className="topbar-title">Codebase Guide</span>
       <div className="divider-v" />
+
+      <div className={healthClass}>
+        <span className="repo-dot" />
+        <span>{healthLabel}</span>
+      </div>
+
+      <button
+        className="btn-inline"
+        onClick={handleRefreshClick}
+        disabled={reposLoading}
+      >
+        Refresh
+      </button>
+
+      <select
+        className="repo-select"
+        value={selectedRepoId}
+        onChange={(e) => onSelectRepo(e.target.value)}
+        disabled={repoSelectorDisabled}
+      >
+        {repos.length === 0 && <option value="">No repos indexed</option>}
+        {repos.map((repo) => (
+          <option key={repo.repo_id} value={repo.repo_id}>
+            {repo.repo_id} ({repo.chunk_count} chunks)
+          </option>
+        ))}
+      </select>
 
       <div className="topbar-actions">
         <button
           className="btn-upload"
-          onClick={() => uploadState === 'idle' && fileInputRef.current.click()}
+          onClick={() => !uploadDisabled && fileInputRef.current?.click()}
           style={getUploadButtonStyle()}
+          disabled={uploadDisabled}
         >
-          {uploadState === 'uploading' ? (
+          {showSpinner ? (
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" style={{ animation: 'spin 1s linear infinite' }}>
               <path d="M21 12a9 9 0 1 1-6.219-8.56" />
             </svg>
@@ -85,21 +122,36 @@ export default function TopBar({ theme, toggleTheme }) {
               <line x1="12" y1="3" x2="12" y2="15" />
             </svg>
           )}
-          {uploadMessage || 'Upload Repo'}
+          {uploadLabel}
           <input
             ref={fileInputRef}
             type="file"
-            multiple
-            accept=".py,.js,.ts,.tsx,.jsx,.json,.md,.txt,.yaml,.yml,.toml,.cfg,.html,.css"
+            accept=".zip"
             onChange={handleUpload}
             style={{ display: 'none' }}
           />
+        </button>
+
+        <button
+          className="btn-delete"
+          onClick={handleDelete}
+          disabled={!canDelete}
+          title={canDelete ? 'Delete selected repo' : 'Select a repo to delete'}
+        >
+          Delete Repo
         </button>
 
         <button className="btn-theme" onClick={toggleTheme} title="Toggle light/dark mode">
           {theme === 'dark' ? '🌙' : '☀️'}
         </button>
       </div>
+
+      {statusMessage && (
+        <div className="topbar-status">
+          <span>{statusMessage}</span>
+          {chunkProgress && <span className="status-chunk">{chunkProgress}</span>}
+        </div>
+      )}
 
       <style>{`
         @keyframes spin {
@@ -110,4 +162,3 @@ export default function TopBar({ theme, toggleTheme }) {
     </header>
   )
 }
-

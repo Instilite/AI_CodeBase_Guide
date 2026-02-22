@@ -1,16 +1,35 @@
 'use client'
 
 import { useState } from 'react'
-
-const BACKEND_URL = 'http://localhost:8000'
+import { ApiError, impact } from '../lib/api'
 
 const riskColors = {
-  High:   { bg: 'rgba(245,80,80,0.1)',   border: 'rgba(245,80,80,0.3)',   color: '#f55050' },
-  Medium: { bg: 'rgba(245,166,35,0.15)', border: 'rgba(245,166,35,0.3)',  color: 'var(--accent)' },
-  Low:    { bg: 'rgba(61,214,140,0.1)',  border: 'rgba(61,214,140,0.3)',  color: 'var(--green)' },
+  High: { bg: 'rgba(245,80,80,0.1)', border: 'rgba(245,80,80,0.3)', color: '#f55050' },
+  Medium: { bg: 'rgba(245,166,35,0.15)', border: 'rgba(245,166,35,0.3)', color: 'var(--accent)' },
+  Low: { bg: 'rgba(61,214,140,0.1)', border: 'rgba(61,214,140,0.3)', color: 'var(--green)' },
 }
 
-export default function ImpactTab() {
+const toImpactErrorMessage = (error) => {
+  if (error instanceof ApiError) {
+    if (error.error === 'indexing_in_progress') return 'Repo is still indexing. Wait for indexing to complete and retry.'
+    if (error.error === 'repo_not_found') return 'Selected repo was not found. Refresh the repo list and select another repo.'
+    if (error.error === 'validation_error') return 'Request validation failed. Enter a function name and retry.'
+    return error.message
+  }
+
+  if (error instanceof Error && error.message) {
+    return error.message
+  }
+
+  return 'Unable to run Impact analysis right now.'
+}
+
+export default function ImpactTab({
+  selectedRepoId,
+  disabledReason,
+  onEvidenceUpdate,
+  onEvidenceSelect,
+}) {
   const [functionName, setFunctionName] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
@@ -20,32 +39,23 @@ export default function ImpactTab() {
     const name = functionName.trim()
     if (!name || loading) return
 
-    const repoId = localStorage.getItem('repoId') || 'demo_repo'
+    if (!selectedRepoId || disabledReason) {
+      setError(disabledReason || 'Select a repo before running impact analysis.')
+      return
+    }
 
     setLoading(true)
     setError(null)
     setResult(null)
+    onEvidenceUpdate([])
+    onEvidenceSelect?.(null)
 
     try {
-      const response = await fetch(`${BACKEND_URL}/impact`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ repo_id: repoId, function_name: name }),
-      })
-
-      const data = await response.json()
-
-      if (!response.ok) {
-        throw new Error(data.error || 'Something went wrong')
-      }
-
+      const data = await impact(selectedRepoId, name)
       setResult(data)
+      onEvidenceUpdate(data.chunks || [])
     } catch (err) {
-      if (err.message === 'Failed to fetch') {
-        setError('Cannot reach backend. Make sure the Python server is running (cd backend && uvicorn main:app --reload).')
-      } else {
-        setError(err.message)
-      }
+      setError(toImpactErrorMessage(err))
     } finally {
       setLoading(false)
     }
@@ -56,12 +66,18 @@ export default function ImpactTab() {
   }
 
   const riskStyle = result ? (riskColors[result.risk_level] || riskColors.Low) : null
+  const controlsDisabled = loading || Boolean(disabledReason)
 
   return (
     <>
       <div className="section-label" style={{ paddingTop: '16px' }}>Impact Analysis</div>
 
-      {/* Search bar */}
+      {disabledReason && (
+        <div className="inline-notice inline-notice-muted">
+          {disabledReason}
+        </div>
+      )}
+
       <div style={{ padding: '0 20px 16px', display: 'flex', gap: '10px' }}>
         <input
           type="text"
@@ -69,7 +85,7 @@ export default function ImpactTab() {
           onChange={e => setFunctionName(e.target.value)}
           onKeyDown={handleKeyDown}
           placeholder="Enter a function name..."
-          disabled={loading}
+          disabled={controlsDisabled}
           style={{
             flex: 1,
             background: 'var(--surface2)',
@@ -84,15 +100,15 @@ export default function ImpactTab() {
         />
         <button
           onClick={handleSearch}
-          disabled={loading || !functionName.trim()}
+          disabled={controlsDisabled || !functionName.trim()}
           style={{
             background: 'var(--accent)',
             border: 'none',
             borderRadius: '8px',
             width: '42px',
             height: '42px',
-            cursor: loading || !functionName.trim() ? 'not-allowed' : 'pointer',
-            opacity: loading || !functionName.trim() ? 0.5 : 1,
+            cursor: controlsDisabled || !functionName.trim() ? 'not-allowed' : 'pointer',
+            opacity: controlsDisabled || !functionName.trim() ? 0.5 : 1,
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
@@ -112,26 +128,15 @@ export default function ImpactTab() {
       </div>
 
       <div style={{ fontSize: '11px', color: 'var(--text-dim)', padding: '0 20px 16px', lineHeight: 1.5 }}>
-        Enter a function name to see how widely it's used across the codebase and what it does.
+        Enter a function name to see mechanical blast radius and supporting evidence.
       </div>
 
-      {/* Error */}
       {error && (
-        <div style={{
-          margin: '0 20px 16px',
-          padding: '12px 16px',
-          background: 'rgba(245,80,80,0.1)',
-          border: '1px solid rgba(245,80,80,0.3)',
-          borderRadius: '8px',
-          color: '#f55050',
-          fontSize: '12px',
-          lineHeight: 1.6,
-        }}>
+        <div className="inline-notice inline-notice-error">
           {error}
         </div>
       )}
 
-      {/* Loading */}
       {loading && (
         <div style={{ padding: '0 20px' }}>
           {[1, 2, 3].map(i => (
@@ -149,11 +154,20 @@ export default function ImpactTab() {
         </div>
       )}
 
-      {/* Results */}
       {result && !loading && (
         <div style={{ padding: '0 20px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
+          {result.llm_fallback_used && (
+            <div className="inline-notice inline-notice-warning" style={{ margin: 0 }}>
+              Degraded result: LLM fallback mode was used. Evidence is still available.
+            </div>
+          )}
 
-          {/* Risk level + summary card */}
+          {result.message && (
+            <div className="inline-notice inline-notice-muted" style={{ margin: 0 }}>
+              {result.message}
+            </div>
+          )}
+
           <div style={{
             background: 'var(--surface2)',
             border: `1px solid ${riskStyle.border}`,
@@ -178,15 +192,16 @@ export default function ImpactTab() {
                 {result.risk_level} Risk
               </span>
             </div>
+
             <div style={{ fontSize: '12px', color: 'var(--text-muted)', lineHeight: 1.7, marginBottom: '10px' }}>
-              {result.what_it_does}
+              {result.what_it_does || 'No function summary available.'}
             </div>
+
             <div style={{ fontSize: '11px', color: 'var(--text-dim)' }}>
               Referenced in <strong style={{ color: 'var(--accent)' }}>{result.file_count}</strong> file{result.file_count !== 1 ? 's' : ''}
             </div>
           </div>
 
-          {/* Files referencing this function */}
           {result.files_referencing && result.files_referencing.length > 0 && (
             <div style={{
               background: 'var(--surface2)',
@@ -214,54 +229,19 @@ export default function ImpactTab() {
             </div>
           )}
 
-          {/* Evidence chunks */}
-          {result.chunks && result.chunks.length > 0 && (
-            <div style={{
-              background: 'var(--surface2)',
-              border: '1px solid var(--border)',
-              borderRadius: '8px',
-              padding: '16px',
-            }}>
-              <div style={{ fontSize: '10px', letterSpacing: '1.2px', textTransform: 'uppercase', color: 'var(--text-dim)', marginBottom: '10px' }}>
-                Evidence
-              </div>
-              {result.chunks.map((chunk, i) => (
-                <div key={i} style={{ marginBottom: i < result.chunks.length - 1 ? '12px' : 0 }}>
-                  <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '6px' }}>
-                    <span style={{
-                      fontSize: '10px',
-                      fontWeight: 700,
-                      background: 'var(--accent-dim)',
-                      color: 'var(--accent)',
-                      border: '1px solid rgba(245,166,35,0.3)',
-                      borderRadius: '4px',
-                      padding: '2px 7px',
-                    }}>
-                      {chunk.evidence_id}
-                    </span>
-                    <span style={{ fontSize: '11px', color: 'var(--accent2)' }}>{chunk.file_path}</span>
-                    <span style={{ fontSize: '10px', color: 'var(--text-dim)' }}>L{chunk.start_line}–{chunk.end_line}</span>
-                  </div>
-                  <div style={{
-                    background: 'var(--code-bg)',
-                    borderRadius: '6px',
-                    padding: '10px 12px',
-                    fontSize: '11px',
-                    color: 'var(--text-muted)',
-                    whiteSpace: 'pre-wrap',
-                    wordBreak: 'break-word',
-                    lineHeight: 1.7,
-                  }}>
-                    {chunk.text}
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
+          <div style={{
+            background: 'var(--surface2)',
+            border: '1px solid var(--border)',
+            borderRadius: '8px',
+            padding: '12px 16px',
+            fontSize: '11px',
+            color: 'var(--text-dim)',
+          }}>
+            Evidence chunks: <strong style={{ color: 'var(--accent)' }}>{result.chunks.length}</strong> (see right panel)
+          </div>
         </div>
       )}
 
-      {/* Empty state */}
       {!result && !loading && !error && (
         <div style={{
           flex: 1,
@@ -270,13 +250,13 @@ export default function ImpactTab() {
           alignItems: 'center',
           justifyContent: 'center',
           color: 'var(--text-dim)',
-          padding: '40px',
+          padding: '40px 20px',
           textAlign: 'center',
           gap: '10px',
         }}>
-          <div style={{ fontSize: '32px', opacity: 0.3 }}>◈</div>
-          <div style={{ fontSize: '12px', lineHeight: 1.6, maxWidth: '220px' }}>
-            Type a function name above to see its impact across the codebase.
+          <div style={{ fontSize: '32px', opacity: 0.3 }}>◍</div>
+          <div style={{ fontSize: '12px', lineHeight: 1.6, maxWidth: '240px' }}>
+            Search for a function to view risk and evidence.
           </div>
         </div>
       )}

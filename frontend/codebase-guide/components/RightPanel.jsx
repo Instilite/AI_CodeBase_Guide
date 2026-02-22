@@ -1,7 +1,9 @@
 'use client'
 
-// Backend returns chunks with: evidence_id, file_path, start_line, end_line, text, similarity
+import { useEffect, useRef } from 'react'
+
 function getSimClass(similarity) {
+  if (similarity === null || similarity === undefined) return 'pct-na'
   if (similarity >= 0.65) return 'pct-high'
   if (similarity >= 0.45) return 'pct-med'
   return 'pct-low'
@@ -34,20 +36,39 @@ function EmptyState() {
       gap: '10px',
     }}>
       <div style={{ fontSize: '32px', opacity: 0.3 }}>◈</div>
-      <div style={{ fontSize: '12px', lineHeight: 1.6, maxWidth: '220px' }}>
-        Evidence from your codebase will appear here after you ask a question.
+      <div style={{ fontSize: '12px', lineHeight: 1.6, maxWidth: '240px' }}>
+        Evidence chunks will appear here after Ask or Impact analysis.
       </div>
     </div>
   )
 }
 
-export default function RightPanel({ evidence = [], totalFiles }) {
+export default function RightPanel({ evidence = [], totalFiles, activeEvidenceId, onEvidenceSelect }) {
+  const cardRefs = useRef(new Map())
+  const fileHint = typeof totalFiles === 'number' ? ` (${totalFiles})` : ''
+
+  useEffect(() => {
+    if (!activeEvidenceId) return
+    const target = cardRefs.current.get(activeEvidenceId)
+    if (!target) return
+    target.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  }, [activeEvidenceId, evidence])
+
+  const setCardRef = (id, node) => {
+    if (!id) return
+    if (node) {
+      cardRefs.current.set(id, node)
+    } else {
+      cardRefs.current.delete(id)
+    }
+  }
+
   return (
     <div className="right-panel">
       <div className="evidence-header">
         <span className="evidence-label">Evidence</span>
         <span className="chunks-tag">
-          {evidence.length > 0 ? `${evidence.length} chunks` : '—'}
+          {evidence.length > 0 ? `${evidence.length} chunks${fileHint}` : '—'}
         </span>
       </div>
 
@@ -56,29 +77,36 @@ export default function RightPanel({ evidence = [], totalFiles }) {
       ) : (
         <div className="evidence-list">
           {evidence.map((chunk, i) => {
-            const similarity = chunk.similarity ?? 0
-            const simPct = Math.round(similarity * 100)
+            const hasSimilarity = typeof chunk.similarity === 'number'
+            const similarity = hasSimilarity ? chunk.similarity : null
+            const simPct = hasSimilarity ? Math.round(similarity * 100) : null
             const simClass = getSimClass(similarity)
             const gradient = getBarGradient(i)
 
-            // Split file_path into folder + filename
             const parts = (chunk.file_path || '').split('/')
             const filename = parts.pop()
             const filePath = parts.length > 0 ? parts.join('/') + '/' : ''
+            const isActive = activeEvidenceId && chunk.evidence_id === activeEvidenceId
 
             return (
-              <div key={chunk.evidence_id || i} className="ev-card">
+              <div
+                key={chunk.evidence_id || i}
+                ref={(node) => setCardRef(chunk.evidence_id, node)}
+                className={`ev-card ${isActive ? 'active' : ''}`}
+                onClick={() => onEvidenceSelect?.(chunk.evidence_id)}
+              >
                 <div className="ev-top-bar" style={{ background: gradient }} />
                 <div className="ev-meta">
                   <span className="ev-num">{chunk.evidence_id || `E${i + 1}`}</span>
                   <span className="ev-file">
                     {filePath}<span>{filename}</span>
                   </span>
-                  {chunk.start_line && (
+                  {chunk.start_line ? (
                     <span className="ev-lines">L{chunk.start_line}–{chunk.end_line}</span>
-                  )}
-                  <span className={`ev-pct ${simClass}`}>{simPct}%</span>
+                  ) : null}
+                  <span className={`ev-pct ${simClass}`}>{simPct === null ? '—' : `${simPct}%`}</span>
                 </div>
+                <div className="ev-source">{chunk.source === 'grep' ? 'grep' : 'vector'}</div>
                 {chunk.text && (
                   <div className="ev-code" style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
                     {chunk.text}

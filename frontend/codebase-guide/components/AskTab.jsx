@@ -1,6 +1,7 @@
 'use client'
 
 import { useState, useRef } from 'react'
+import { ApiError, ask } from '../lib/api'
 
 const QUICK_QUESTIONS = [
   'What does this project do?',
@@ -12,19 +13,37 @@ const QUICK_QUESTIONS = [
   'How is authentication handled?',
 ]
 
-const BACKEND_URL = 'http://localhost:8000'
+const toAskErrorMessage = (error) => {
+  if (error instanceof ApiError) {
+    if (error.error === 'indexing_in_progress') return 'Repo is still indexing. Wait for indexing to complete and try again.'
+    if (error.error === 'repo_not_found') return 'Selected repo was not found. Refresh the repo list and select another repo.'
+    if (error.error === 'validation_error') return 'Request validation failed. Check repo selection and question text.'
+    return error.message
+  }
 
-export default function AskTab({ onEvidenceUpdate, onFilesUpdate }) {
+  if (error instanceof Error && error.message) {
+    return error.message
+  }
+
+  return 'Unable to run Ask right now.'
+}
+
+export default function AskTab({
+  selectedRepoId,
+  disabledReason,
+  onEvidenceUpdate,
+  onFilesUpdate,
+  onEvidenceSelect,
+}) {
   const [activeQuestion, setActiveQuestion] = useState(null)
   const [inputValue, setInputValue] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
-  const [claims, setClaims] = useState([])
-  const [confidence, setConfidence] = useState(null)
-  const [confidenceLabel, setConfidenceLabel] = useState(null)
+  const [response, setResponse] = useState(null)
   const textareaRef = useRef(null)
 
   const handleQuickSelect = (question) => {
+    if (loading) return
     setActiveQuestion(question)
     setInputValue(question)
     textareaRef.current?.focus()
@@ -41,43 +60,25 @@ export default function AskTab({ onEvidenceUpdate, onFilesUpdate }) {
     const question = inputValue.trim()
     if (!question || loading) return
 
-    const repoId = localStorage.getItem('repoId') || 'demo_repo'
+    if (!selectedRepoId || disabledReason) {
+      setError(disabledReason || 'Select a repo before asking a question.')
+      return
+    }
 
     setLoading(true)
     setError(null)
-    setClaims([])
-    setConfidence(null)
-    setConfidenceLabel(null)
+    setResponse(null)
     onEvidenceUpdate([])
+    onFilesUpdate(0)
+    onEvidenceSelect?.(null)
 
     try {
-      const response = await fetch(`${BACKEND_URL}/ask`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ repo_id: repoId, question }),
-      })
-
-      const data = await response.json()
-
-      if (!response.ok) {
-        throw new Error(data.error || 'Something went wrong')
-      }
-
-      // Backend returns claims as [{ claim: "...", evidence: ["E1"] }]
-      // and chunks as the evidence items
-      setClaims(data.claims || [])
-      setConfidence(data.confidence_score ?? null)
-      setConfidenceLabel(data.confidence_label ?? null)
+      const data = await ask(selectedRepoId, question)
+      setResponse(data)
       onEvidenceUpdate(data.chunks || [])
-      onFilesUpdate(data.chunks?.length ?? 0)
-
+      onFilesUpdate(new Set((data.chunks || []).map((chunk) => chunk.file_path)).size)
     } catch (err) {
-      // Distinguish between backend being down vs actual errors
-      if (err.message === 'Failed to fetch') {
-        setError('Cannot reach backend. Make sure the Python server is running on port 8000 (cd backend && uvicorn main:app --reload).')
-      } else {
-        setError(err.message)
-      }
+      setError(toAskErrorMessage(err))
     } finally {
       setLoading(false)
     }
@@ -90,16 +91,28 @@ export default function AskTab({ onEvidenceUpdate, onFilesUpdate }) {
     }
   }
 
-  const hasResults = claims.length > 0
+  const hasResults = Boolean(response)
 
   const formatConfidenceLabel = (label) => {
     if (!label) return ''
     return label.charAt(0).toUpperCase() + label.slice(1).toLowerCase()
   }
 
+  const confidence = typeof response?.confidence_score === 'number' ? response.confidence_score : null
+  const safeConfidence = confidence === null ? 0 : Math.max(0, Math.min(confidence, 1))
+  const claims = Array.isArray(response?.claims) ? response.claims : []
+
+  const controlsDisabled = loading || Boolean(disabledReason)
+
   return (
     <>
       <div className="section-label">Overview / Project Map</div>
+
+      {disabledReason && (
+        <div className="inline-notice inline-notice-muted">
+          {disabledReason}
+        </div>
+      )}
 
       <div className="quick-buttons">
         {QUICK_QUESTIONS.map((q) => (
@@ -107,6 +120,7 @@ export default function AskTab({ onEvidenceUpdate, onFilesUpdate }) {
             key={q}
             className={`quick-btn ${activeQuestion === q ? 'active' : ''}`}
             onClick={() => handleQuickSelect(q)}
+            disabled={controlsDisabled}
           >
             {q}
           </button>
@@ -122,13 +136,13 @@ export default function AskTab({ onEvidenceUpdate, onFilesUpdate }) {
           onKeyDown={handleKeyDown}
           rows={1}
           placeholder="Ask anything about your codebase..."
-          disabled={loading}
+          disabled={controlsDisabled}
         />
         <button
           className="ask-btn"
           onClick={handleAsk}
-          disabled={loading || !inputValue.trim()}
-          style={{ opacity: loading || !inputValue.trim() ? 0.5 : 1 }}
+          disabled={controlsDisabled || !inputValue.trim()}
+          style={{ opacity: controlsDisabled || !inputValue.trim() ? 0.5 : 1 }}
         >
           {loading ? (
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#0e0e12" strokeWidth="2.5" style={{ animation: 'spin 1s linear infinite' }}>
@@ -143,23 +157,12 @@ export default function AskTab({ onEvidenceUpdate, onFilesUpdate }) {
         </button>
       </div>
 
-      {/* Error */}
       {error && (
-        <div style={{
-          margin: '0 20px 16px',
-          padding: '12px 16px',
-          background: 'rgba(245,80,80,0.1)',
-          border: '1px solid rgba(245,80,80,0.3)',
-          borderRadius: '8px',
-          color: '#f55050',
-          fontSize: '12px',
-          lineHeight: 1.6,
-        }}>
+        <div className="inline-notice inline-notice-error">
           {error}
         </div>
       )}
 
-      {/* Loading skeleton */}
       {loading && (
         <div style={{ padding: '0 20px 16px' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '16px', color: 'var(--text-dim)', fontSize: '12px' }}>
@@ -184,41 +187,60 @@ export default function AskTab({ onEvidenceUpdate, onFilesUpdate }) {
         </div>
       )}
 
-      {/* Results */}
       {hasResults && !loading && (
         <>
+          {response?.llm_fallback_used && (
+            <div className="inline-notice inline-notice-warning">
+              Degraded result: LLM fallback mode was used. Claims may be limited, but evidence remains valid.
+            </div>
+          )}
+
           {confidence !== null && (
             <div className="confidence-bar-wrap">
               <span className="conf-label">Retrieval Confidence</span>
               <div className="conf-track">
-                <div className="conf-fill" style={{ width: `${confidence * 100}%` }} />
+                <div className="conf-fill" style={{ width: `${safeConfidence * 100}%` }} />
               </div>
-              <span className="conf-val">{confidence.toFixed(2)}</span>
-              <span className="conf-tag">{formatConfidenceLabel(confidenceLabel)}</span>
+              <span className="conf-val">{safeConfidence.toFixed(2)}</span>
+              <span className="conf-tag">{formatConfidenceLabel(response?.confidence_label)}</span>
             </div>
           )}
 
           <div className="analysis-header">
             <span className="analysis-title">Analysis</span>
             <div className="analysis-right">
-              <div className="overview-tag">Overview</div>
+              <div className="overview-tag">{response?.retrieval_mode === 'overview' ? 'Overview' : 'Standard'}</div>
               <span className="claims-tag">{claims.length} claims</span>
             </div>
           </div>
 
           <div className="cards-area">
+            {claims.length === 0 && (
+              <div className="card">
+                <div className="card-body">
+                  No structured claims were returned. Review the evidence panel for grounded chunks.
+                </div>
+              </div>
+            )}
+
             {claims.map((item, i) => (
               <div key={i} className="card">
                 <div className="card-header">
                   <span className="card-title">Finding {i + 1}</span>
                   <span className="project-map-tag">Project Map</span>
                 </div>
-                {/* Backend returns { claim: "...", evidence: ["E1", "E2"] } */}
                 <div className="card-body">{item.claim}</div>
                 {item.evidence && item.evidence.length > 0 && (
                   <div className="evidence-tags">
                     {item.evidence.map((eId, j) => (
-                      <span key={j} className="ev-tag">{eId}</span>
+                      <button
+                        type="button"
+                        key={`${eId}-${j}`}
+                        className="ev-tag"
+                        onClick={() => onEvidenceSelect?.(eId)}
+                      >
+                        {eId}
+                      </button>
                     ))}
                   </div>
                 )}
@@ -228,7 +250,6 @@ export default function AskTab({ onEvidenceUpdate, onFilesUpdate }) {
         </>
       )}
 
-      {/* Empty state */}
       {!hasResults && !loading && !error && (
         <div style={{
           flex: 1,
